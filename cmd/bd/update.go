@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -46,6 +47,9 @@ stderr, and the command exits nonzero.`,
 		}()
 
 		if usesProxiedServer() {
+			if _, hasGuard := ownershipGuardFromFlags(cmd); hasGuard {
+				return reportGuardUnsupported(cmd, "proxied-server mode does not enforce ownership guards yet")
+			}
 			return runUpdateProxiedServer(cmd, rootCtx, args)
 		}
 
@@ -321,6 +325,25 @@ stderr, and the command exits nonzero.`,
 		}
 
 		ctx := rootCtx
+		guard, hasGuard := ownershipGuardFromFlags(cmd)
+		if gerr := validateGuardInvocation(cmd, len(args)); gerr != nil {
+			return gerr
+		}
+		if hasGuard {
+			// Fail closed on sub-operations that have no guarded form:
+			// silently dropping a supplied guard is the one forbidden
+			// outcome (see issueops/guard.go). Claim never consults guards
+			// (a fresh claim bumps the fence, so a pre-claim guard would
+			// self-conflict); label/parent ops bypass updateIssueInTx.
+			if claimFlag {
+				return reportGuardUnsupported(cmd, "--claim cannot be combined with ownership guards (a claim is its own ownership transition)")
+			}
+			for _, f := range []string{"add-label", "remove-label", "set-labels", "parent"} {
+				if cmd.Flags().Changed(f) {
+					return reportGuardUnsupported(cmd, fmt.Sprintf("--%s bypasses the guarded update path and cannot be combined with ownership guards", f))
+				}
+			}
+		}
 
 		updatedIssues := []*types.Issue{}
 		var firstUpdatedID string // Track first successful update for last-touched
@@ -389,6 +412,18 @@ stderr, and the command exits nonzero.`,
 			if claimFlag {
 				if err := issueStore.ClaimIssue(ctx, result.ResolvedID, actor); err != nil {
 					fmt.Fprintf(os.Stderr, "Error claiming %s: %v\n", id, err)
+					// Typed body alongside the frozen text (additive contract):
+					// old consumers substring-match the line above, new ones
+					// parse this JSON. Gated on the actual claim-loss class so
+					// closed/transient failures are never mislabeled. Holder
+					// re-read best-effort.
+					if errors.Is(err, storage.ErrAlreadyClaimed) {
+						holder := ""
+						if cur, gerr := issueStore.GetIssue(ctx, result.ResolvedID); gerr == nil && cur != nil {
+							holder = cur.Assignee
+						}
+						emitAlreadyClaimedJSON(cmd, result.ResolvedID, holder)
+					}
 					recordFailure(id, fmt.Sprintf("claiming issue: %v", err))
 					closeIfUnmutated(result)
 					continue
@@ -416,7 +451,16 @@ stderr, and the command exits nonzero.`,
 				regularUpdates["status"] = string(types.StatusOpen)
 			}
 			if len(regularUpdates) > 0 {
-				if err := issueStore.UpdateIssue(ctx, result.ResolvedID, regularUpdates, actor); err != nil {
+				// The guard scopes to exactly this update of this issue.
+				mutCtx := ctx
+				if hasGuard {
+					mutCtx = issueops.WithGuard(ctx, guard)
+				}
+				if err := issueStore.UpdateIssue(mutCtx, result.ResolvedID, regularUpdates, actor); err != nil {
+					if handled, cerr := maybeReportOwnershipConflict(cmd, err); handled {
+						closeIfUnmutated(result)
+						return cerr
+					}
 					fmt.Fprintf(os.Stderr, "Error updating %s: %v\n", id, err)
 					recordFailure(id, fmt.Sprintf("updating issue: %v", err))
 					closeIfUnmutated(result)
@@ -690,5 +734,6 @@ func init() {
 	updateCmd.Flags().StringArray("set-metadata", nil, "Set metadata key=value (repeatable, e.g., --set-metadata team=platform)")
 	updateCmd.Flags().StringArray("unset-metadata", nil, "Remove metadata key (repeatable, e.g., --unset-metadata team)")
 	updateCmd.ValidArgsFunction = issueIDCompletion
+	registerOwnershipGuardFlags(updateCmd)
 	rootCmd.AddCommand(updateCmd)
 }
