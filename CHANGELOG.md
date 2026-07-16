@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The no-ID "last touched issue" fallback on `bd update` / `bd close` is
+  now interactive-only** (bd-m00pb,
+  [#4839](https://github.com/gastownhall/beads/pull/4839)).
+  Previously a scripted `bd update $ID ...` with an accidentally empty `$ID`
+  silently mutated whatever issue was touched last — a real agent session
+  corrupted an unrelated closed bead this way. The fallback now requires
+  stdin to be a terminal; `BD_NON_INTERACTIVE=1` and `CI=1/true` also
+  disable it. Scripts that intentionally relied on it can set
+  `BD_LAST_TOUCHED_FALLBACK=1` (or `=0` to disable the fallback
+  everywhere). Explicit IDs and `bd show --current` are unaffected.
+
 - **Cross-type blocking dependencies are now allowed** (bd-wg7ve,
   [#4034](https://github.com/gastownhall/beads/pull/4034)).
   `bd dep add <task> <epic>` — gating a work item on an epic (program)
