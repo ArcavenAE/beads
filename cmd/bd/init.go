@@ -264,7 +264,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		}
 		if len(backendOpts) > 0 {
 			if b, ok := backends.Lookup(backendFlag); !ok || b.Provision == nil {
-				return fmt.Errorf("--backend-opt requires a backend provisioned through the backend registry (this build: --backend=sqlite); postgres/mysql use --pg-url/--pg-schema and --mysql-url/--mysql-database, and the default Dolt backend takes no backend options")
+				return fmt.Errorf("--backend-opt requires a backend provisioned through the backend registry (this build: --backend=%s); postgres/mysql use --pg-url/--pg-schema and --mysql-url/--mysql-database, and the default Dolt backend takes no backend options", strings.Join(backends.Provisionable(), "|"))
 			}
 		}
 		if isPostgres || isMySQL || isSQLite {
@@ -2134,13 +2134,27 @@ func runInitSQLite(ctx context.Context, in initSQLiteInput) error {
 	applyBackendPersist(cfg, configfile.BackendSQLite, persist)
 	// The registry open below resolves the database location from
 	// metadata.json, so the backend selection and provisioning results must
-	// be persisted before opening.
+	// be persisted before opening. Snapshot the prior contents first: a
+	// failure between here and the final save must leave metadata.json as it
+	// was, or a failed init would strand a half-initialized workspace that
+	// the already-initialized guard then blocks (main wrote metadata.json
+	// only after full success, and retries must keep working the same way).
+	priorMetadata, priorErr := os.ReadFile(configfile.ConfigPath(in.beadsDir))
+	restoreMetadata := func() {
+		if priorErr == nil {
+			// 0600 matches configfile.Save's permissions.
+			_ = os.WriteFile(configfile.ConfigPath(in.beadsDir), priorMetadata, 0o600)
+		} else {
+			_ = os.Remove(configfile.ConfigPath(in.beadsDir))
+		}
+	}
 	if err := cfg.Save(in.beadsDir); err != nil {
 		return fmt.Errorf("failed to write metadata.json: %w", err)
 	}
 
 	store, err := backend.Open(ctx, in.beadsDir)
 	if err != nil {
+		restoreMetadata()
 		return fmt.Errorf("failed to open SQLite workspace: %w", err)
 	}
 	defer func() { _ = store.Close() }()
@@ -2149,6 +2163,7 @@ func runInitSQLite(ctx context.Context, in initSQLiteInput) error {
 		if existing, _ := store.GetConfig(ctx, "issue_prefix"); existing == "" {
 			issuePrefix := strings.ReplaceAll(in.prefix, ".", "_")
 			if err := store.SetConfig(ctx, "issue_prefix", issuePrefix); err != nil {
+				restoreMetadata()
 				return fmt.Errorf("failed to set issue prefix: %w", err)
 			}
 		}
@@ -2162,12 +2177,14 @@ func runInitSQLite(ctx context.Context, in initSQLiteInput) error {
 			projectID = configfile.GenerateProjectID()
 		}
 		if err := store.SetMetadata(ctx, "_project_id", projectID); err != nil {
+			restoreMetadata()
 			return fmt.Errorf("failed to write project ID: %w", err)
 		}
 	}
 
 	cfg.ProjectID = projectID
 	if err := cfg.Save(in.beadsDir); err != nil {
+		restoreMetadata()
 		return fmt.Errorf("failed to write metadata.json: %w", err)
 	}
 	relPath := cfg.GetSQLitePath()
