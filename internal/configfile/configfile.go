@@ -50,6 +50,13 @@ type Config struct {
 	// SQLite backend (backend="sqlite"). File-based, embedded; no credentials.
 	SQLitePath string `json:"sqlite_path,omitempty"` // database file, relative to the beads dir (default beads.db)
 
+	// BackendConfig carries backend-specific config entries recorded by a
+	// registered backend's Provision hook at bd init time (see
+	// internal/storage/backends). Keys and meanings are owned by the backend
+	// that wrote them; bd core only round-trips the map. The SQLite database
+	// path stays in the legacy sqlite_path field above for compatibility.
+	BackendConfig map[string]string `json:"backend_config,omitempty"`
+
 	// Project identity — unique ID generated at bd init time.
 	// Used to detect cross-project data leakage when a client connects
 	// to the wrong Dolt server (GH#2372).
@@ -278,6 +285,16 @@ func (c *Config) GetSQLitePath() string {
 		return ""
 	}
 	return c.SQLitePath
+}
+
+// GetBackendConfig returns the backend-specific config entries recorded at
+// bd init time by the configured backend's Provision hook. May be nil;
+// callers may index it directly.
+func (c *Config) GetBackendConfig() map[string]string {
+	if c == nil {
+		return nil
+	}
+	return c.BackendConfig
 }
 
 // GetPostgresDSN returns the base Postgres connection string: BEADS_POSTGRES_URL (a

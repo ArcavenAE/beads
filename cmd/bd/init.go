@@ -33,6 +33,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/pgdialect"
 	"github.com/steveyegge/beads/internal/storage/postgres"
 	"github.com/steveyegge/beads/internal/storage/schema"
+	"github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/templates/agents"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -111,6 +112,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		mysqlURL, _ := cmd.Flags().GetString("mysql-url")
 		mysqlDatabase, _ := cmd.Flags().GetString("mysql-database")
 		sqlitePath, _ := cmd.Flags().GetString("sqlite-path")
+		backendOptEntries, _ := cmd.Flags().GetStringArray("backend-opt")
 
 		// --force is a deprecated alias for --reinit-local. They share
 		// semantics for the local data-safety guard; both refuse remote
@@ -251,6 +253,20 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		if backendFlag != "" && backendFlag != configfile.BackendDolt && !isPostgres && !isMySQL && !isSQLite {
 			return fmt.Errorf("unknown backend %q: supported backends are \"dolt\" (default), \"postgres\", \"mysql\", and \"sqlite\"", backendFlag)
 		}
+		// --backend-opt is the generic provisioning-option surface for any
+		// backend provisioned through the backend registry: parsed here, the
+		// options flow into the backend's ProvisionRequest untouched. Only
+		// backends with a registry Provision hook accept it — PostgreSQL and
+		// MySQL provision through their dedicated DSN-validating flags.
+		backendOpts, optErr := parseBackendOpts(backendOptEntries)
+		if optErr != nil {
+			return optErr
+		}
+		if len(backendOpts) > 0 {
+			if b, ok := backends.Lookup(backendFlag); !ok || b.Provision == nil {
+				return fmt.Errorf("--backend-opt requires a backend provisioned through the backend registry (this build: --backend=sqlite); postgres/mysql use --pg-url/--pg-schema and --mysql-url/--mysql-database, and the default Dolt backend takes no backend options")
+			}
+		}
 		if isPostgres || isMySQL || isSQLite {
 			// A non-Dolt SQL backend is a plain local workspace: only a small set of
 			// init-local flags apply. Reject any other init-local flag by ALLOWLIST — a
@@ -261,8 +277,8 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				"backend": true,
 				"pg-url":  true, "pg-schema": true,
 				"mysql-url": true, "mysql-database": true,
-				"sqlite-path": true,
-				"prefix":      true, "quiet": true,
+				"sqlite-path": true, "backend-opt": true,
+				"prefix": true, "quiet": true,
 				"skip-hooks": true, "skip-agents": true,
 				"reinit-local": true, "force": true, "init-if-missing": true,
 				"non-interactive": true,
@@ -282,6 +298,19 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			if len(rejected) > 0 {
 				sort.Strings(rejected)
 				return fmt.Errorf("bd init --backend=%s does not support %s (a non-Dolt SQL backend is a plain local workspace: no Dolt server, sync, remote, or wizard)", backendFlag, strings.Join(rejected, ", "))
+			}
+
+			// --sqlite-path is sugar for the sqlite backend's generic "path"
+			// option. Both spellings stay supported; passing both with
+			// different values is an explicit conflict, not a precedence rule.
+			if isSQLite && sqlitePath != "" {
+				if prior, ok := backendOpts[sqlite.ProvisionOptionPath]; ok && prior != sqlitePath {
+					return fmt.Errorf("--sqlite-path %q conflicts with --backend-opt %s=%q; pass one of them (or the same value in both)", sqlitePath, sqlite.ProvisionOptionPath, prior)
+				}
+				if backendOpts == nil {
+					backendOpts = make(map[string]string, 1)
+				}
+				backendOpts[sqlite.ProvisionOptionPath] = sqlitePath
 			}
 		}
 
@@ -837,7 +866,7 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			return runInitSQLite(ctx, initSQLiteInput{
 				beadsDir:   beadsDir,
 				prefix:     prefix,
-				sqlitePath: sqlitePath,
+				options:    backendOpts,
 				quiet:      quiet,
 				jsonOutput: jsonOutput,
 			})
@@ -2030,39 +2059,91 @@ func runInitMySQL(ctx context.Context, in initMySQLInput) error {
 type initSQLiteInput struct {
 	beadsDir   string
 	prefix     string
-	sqlitePath string
+	options    map[string]string // backend provisioning options (--backend-opt / --sqlite-path sugar)
 	quiet      bool
 	jsonOutput bool
 }
 
+// parseBackendOpts parses repeated --backend-opt key=value entries into an
+// options map for the backend's ProvisionRequest. Each entry splits at its
+// first '=': the key must be non-empty and unique, while the value may
+// itself contain '=' (DSNs with query parameters, for one). Returns nil for
+// no entries.
+func parseBackendOpts(entries []string) (map[string]string, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	opts := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		key, value, found := strings.Cut(entry, "=")
+		if !found {
+			return nil, fmt.Errorf("invalid --backend-opt %q: expected key=value", entry)
+		}
+		if key == "" {
+			return nil, fmt.Errorf("invalid --backend-opt %q: key must be non-empty", entry)
+		}
+		if _, dup := opts[key]; dup {
+			return nil, fmt.Errorf("duplicate --backend-opt key %q", key)
+		}
+		opts[key] = value
+	}
+	return opts, nil
+}
+
+// applyBackendPersist records onto cfg the config entries a backend's
+// Provision hook returned for persistence. Entries land in the generic
+// backend_config map in metadata.json; the SQLite backend's path entry maps
+// onto the legacy sqlite_path field instead, so existing workspaces and
+// older bd versions keep reading the database location from the same place.
+func applyBackendPersist(cfg *configfile.Config, backendName string, persist map[string]string) {
+	for key, value := range persist {
+		if backendName == configfile.BackendSQLite && key == sqlite.ProvisionOptionPath {
+			cfg.SQLitePath = value
+			continue
+		}
+		if cfg.BackendConfig == nil {
+			cfg.BackendConfig = make(map[string]string, len(persist))
+		}
+		cfg.BackendConfig[key] = value
+	}
+}
+
 // runInitSQLite finalizes a SQLite-backed workspace: it provisions the database file
 // (default beads.db inside the beads dir) through the backend registry's provision
-// hook, seeds the issue prefix and project identity, and writes metadata.json. SQLite
-// is file-based and embedded (pure-Go), so there is no server, DSN, or password.
+// hook, persists the returned backend config in metadata.json, and seeds the issue
+// prefix and project identity. SQLite is file-based and embedded (pure-Go), so there
+// is no server, DSN, or password.
 func runInitSQLite(ctx context.Context, in initSQLiteInput) error {
-	relPath := in.sqlitePath
-	if relPath == "" {
-		relPath = "beads.db"
-	}
-	dbPath := relPath
-	if !filepath.IsAbs(dbPath) {
-		dbPath = filepath.Join(in.beadsDir, dbPath)
-	}
-
 	backend, ok := backends.Lookup(configfile.BackendSQLite)
 	if !ok || backend.Provision == nil {
 		return fmt.Errorf("SQLite backend is not registered in this build (see cmd/bd/backends_builtin.go)")
 	}
-	store, err := backend.Provision(ctx, dbPath)
+	persist, err := backend.Provision(ctx, backends.ProvisionRequest{
+		BeadsDir: in.beadsDir,
+		Options:  in.options,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to initialize SQLite workspace: %w", err)
 	}
-	defer func() { _ = store.Close() }()
 
 	cfg, _ := configfile.Load(in.beadsDir)
 	if cfg == nil {
 		cfg = configfile.DefaultConfig()
 	}
+	cfg.Backend = configfile.BackendSQLite
+	applyBackendPersist(cfg, configfile.BackendSQLite, persist)
+	// The registry open below resolves the database location from
+	// metadata.json, so the backend selection and provisioning results must
+	// be persisted before opening.
+	if err := cfg.Save(in.beadsDir); err != nil {
+		return fmt.Errorf("failed to write metadata.json: %w", err)
+	}
+
+	store, err := backend.Open(ctx, in.beadsDir)
+	if err != nil {
+		return fmt.Errorf("failed to open SQLite workspace: %w", err)
+	}
+	defer func() { _ = store.Close() }()
 
 	if in.prefix != "" {
 		if existing, _ := store.GetConfig(ctx, "issue_prefix"); existing == "" {
@@ -2085,12 +2166,11 @@ func runInitSQLite(ctx context.Context, in initSQLiteInput) error {
 		}
 	}
 
-	cfg.Backend = configfile.BackendSQLite
-	cfg.SQLitePath = relPath
 	cfg.ProjectID = projectID
 	if err := cfg.Save(in.beadsDir); err != nil {
 		return fmt.Errorf("failed to write metadata.json: %w", err)
 	}
+	relPath := cfg.GetSQLitePath()
 
 	switch {
 	case in.jsonOutput:
@@ -2144,6 +2224,7 @@ func init() {
 	initCmd.Flags().String("mysql-url", "", "MySQL server DSN (with --backend=mysql), e.g. user:pass@tcp(host:3306)/ . A password may be included for init but is never persisted; set BEADS_MYSQL_PASSWORD for later commands. Falls back to BEADS_MYSQL_URL.")
 	initCmd.Flags().String("mysql-database", "", "MySQL database for this workspace (with --backend=mysql; MySQL's isolation unit)")
 	initCmd.Flags().String("sqlite-path", "", "SQLite database file (with --backend=sqlite; relative to the beads dir, default beads.db)")
+	initCmd.Flags().StringArray("backend-opt", nil, "Backend-specific provisioning option as key=value (repeatable; interpreted by the backend selected with --backend)")
 
 	// Dolt server connection flags
 	initCmd.Flags().Bool("server", false, "Use external dolt sql-server instead of embedded engine")

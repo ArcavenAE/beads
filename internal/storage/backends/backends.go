@@ -25,6 +25,19 @@ import (
 	"github.com/steveyegge/beads/internal/storage"
 )
 
+// ProvisionRequest carries the inputs to a backend's Provision hook. It is
+// deliberately backend-agnostic: whatever a backend needs beyond the
+// workspace location (a file path, a DSN, a schema name, …) arrives as
+// options, and their keys and meanings are owned by the backend.
+type ProvisionRequest struct {
+	// BeadsDir is the workspace's .beads directory.
+	BeadsDir string
+
+	// Options are backend-specific provisioning options, typically from
+	// repeated `bd init --backend-opt key=value` flags. May be nil.
+	Options map[string]string
+}
+
 // Backend describes a registered storage backend. All paths receive the
 // workspace's .beads directory and resolve backend-specific configuration
 // themselves (typically from metadata.json).
@@ -37,10 +50,12 @@ type Backend struct {
 	// the same function as Open.
 	OpenReadOnly func(ctx context.Context, beadsDir string) (storage.DoltStorage, error)
 
-	// Provision creates and initializes the backend's database for bd init.
-	// dbPath is the resolved absolute database location. May be nil for
+	// Provision creates and initializes the backend's database for bd init,
+	// resolving whatever it needs from the request options. persist is the
+	// set of backend-specific config entries the backend wants recorded in
+	// metadata.json for later opens; empty/nil is fine. May be nil for
 	// backends that bd init cannot provision.
-	Provision func(ctx context.Context, dbPath string) (storage.DoltStorage, error)
+	Provision func(ctx context.Context, req ProvisionRequest) (persist map[string]string, err error)
 
 	// WorkspaceIsBeadsDir reports that the .beads directory itself is the
 	// workspace: there is no separately discoverable database directory, so

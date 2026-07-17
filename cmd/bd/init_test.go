@@ -2477,6 +2477,145 @@ func TestInitBackendFlag(t *testing.T) {
 			t.Errorf("Expected backend %q, got %q", configfile.BackendDolt, cfg.Backend)
 		}
 	})
+
+	// --backend-opt is the generic provisioning-option surface for registered
+	// backends; for sqlite, path is the same option --sqlite-path sugars.
+	initSQLite := func(t *testing.T, args ...string) (*configfile.Config, string, []byte, error) {
+		t.Helper()
+		tmpDir := t.TempDir()
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		cmd := exec.Command(bd, append([]string{"init", "--backend", "sqlite", "--quiet"}, args...)...)
+		cmd.Dir = tmpDir
+		cmd.Env = initBackendTestEnv(beadsDir)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return nil, beadsDir, out, err
+		}
+		cfg, cfgErr := configfile.Load(beadsDir)
+		if cfgErr != nil || cfg == nil {
+			t.Fatalf("failed to load metadata.json: %v", cfgErr)
+		}
+		return cfg, beadsDir, out, nil
+	}
+
+	t.Run("sqlite_backend_opt_path", func(t *testing.T) {
+		cfg, beadsDir, out, err := initSQLite(t, "--backend-opt", "path=custom.db")
+		if err != nil {
+			t.Fatalf("init with --backend-opt path= should succeed: %v\n%s", err, out)
+		}
+		if cfg.SQLitePath != "custom.db" {
+			t.Errorf("sqlite_path = %q, want %q", cfg.SQLitePath, "custom.db")
+		}
+		if len(cfg.BackendConfig) != 0 {
+			t.Errorf("sqlite path leaked into backend_config: %v", cfg.BackendConfig)
+		}
+		if _, err := os.Stat(filepath.Join(beadsDir, "custom.db")); err != nil {
+			t.Errorf("database file not created at option path: %v", err)
+		}
+	})
+
+	t.Run("sqlite_path_and_backend_opt_conflict", func(t *testing.T) {
+		_, _, out, err := initSQLite(t, "--sqlite-path", "a.db", "--backend-opt", "path=b.db")
+		if err == nil || !strings.Contains(string(out), "conflicts") {
+			t.Errorf("conflicting path spellings: err = %v, want conflict error, got: %s", err, out)
+		}
+	})
+
+	t.Run("sqlite_path_and_backend_opt_agree", func(t *testing.T) {
+		cfg, _, out, err := initSQLite(t, "--sqlite-path", "same.db", "--backend-opt", "path=same.db")
+		if err != nil {
+			t.Fatalf("matching path spellings should succeed: %v\n%s", err, out)
+		}
+		if cfg.SQLitePath != "same.db" {
+			t.Errorf("sqlite_path = %q, want %q", cfg.SQLitePath, "same.db")
+		}
+	})
+
+	t.Run("backend_opt_malformed", func(t *testing.T) {
+		// "path=a=b" is NOT malformed: values may contain '=' (DSNs with
+		// query parameters); parsing splits at the first '=' only.
+		for _, opt := range []string{"path", "=x.db"} {
+			_, _, out, err := initSQLite(t, "--backend-opt", opt)
+			if err == nil || !strings.Contains(string(out), "--backend-opt") {
+				t.Errorf("malformed --backend-opt %q: err = %v, want parse error, got: %s", opt, err, out)
+			}
+		}
+	})
+
+	t.Run("backend_opt_duplicate_key", func(t *testing.T) {
+		_, _, out, err := initSQLite(t, "--backend-opt", "path=a.db", "--backend-opt", "path=b.db")
+		if err == nil || !strings.Contains(string(out), "duplicate") {
+			t.Errorf("duplicate --backend-opt key: err = %v, want duplicate error, got: %s", err, out)
+		}
+	})
+
+	t.Run("backend_opt_unknown_key", func(t *testing.T) {
+		_, _, out, err := initSQLite(t, "--backend-opt", "nope=x")
+		if err == nil || !strings.Contains(string(out), "unknown provisioning option") {
+			t.Errorf("unknown option key: err = %v, want backend rejection, got: %s", err, out)
+		}
+	})
+
+	t.Run("backend_opt_requires_provision_hook", func(t *testing.T) {
+		// The default Dolt backend and the DSN-provisioned backends have no
+		// registry Provision hook, so --backend-opt is rejected up front
+		// with pointers at the right flags.
+		for _, args := range [][]string{
+			{"init", "--quiet", "--backend-opt", "path=x.db"},
+			{"init", "--backend", "postgres", "--quiet", "--backend-opt", "dsn=postgres://h/db"},
+			{"init", "--backend", "mysql", "--quiet", "--backend-opt", "dsn=u@tcp(h:3306)/"},
+		} {
+			tmpDir := t.TempDir()
+			beadsDir := filepath.Join(tmpDir, ".beads")
+			cmd := exec.Command(bd, args...)
+			cmd.Dir = tmpDir
+			cmd.Env = initBackendTestEnv(beadsDir)
+			out, err := cmd.CombinedOutput()
+			if err == nil || !strings.Contains(string(out), "--backend-opt") {
+				t.Errorf("%v: err = %v, want --backend-opt rejection, got: %s", args, err, out)
+			}
+		}
+	})
+}
+
+func TestParseBackendOpts(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		opts, err := parseBackendOpts([]string{"path=custom.db", "schema=beads_ws", "empty=", "dsn=postgres://h/db?sslmode=require"})
+		if err != nil {
+			t.Fatalf("parseBackendOpts: %v", err)
+		}
+		want := map[string]string{"path": "custom.db", "schema": "beads_ws", "empty": "", "dsn": "postgres://h/db?sslmode=require"}
+		if len(opts) != len(want) {
+			t.Fatalf("opts = %v, want %v", opts, want)
+		}
+		for k, v := range want {
+			if opts[k] != v {
+				t.Errorf("opts[%q] = %q, want %q", k, opts[k], v)
+			}
+		}
+	})
+
+	t.Run("empty input is nil", func(t *testing.T) {
+		if opts, err := parseBackendOpts(nil); err != nil || opts != nil {
+			t.Errorf("parseBackendOpts(nil) = %v, %v; want nil, nil", opts, err)
+		}
+	})
+
+	t.Run("rejected", func(t *testing.T) {
+		for _, tc := range []struct {
+			entries []string
+			wantErr string
+		}{
+			{[]string{"path"}, "expected key=value"},
+			{[]string{"=x"}, "key must be non-empty"},
+			{[]string{"path=a", "path=b"}, "duplicate"},
+		} {
+			_, err := parseBackendOpts(tc.entries)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("parseBackendOpts(%v) err = %v, want containing %q", tc.entries, err, tc.wantErr)
+			}
+		}
+	})
 }
 
 // TestInitDatabaseAdoptsExistingProjectID verifies that bd init --database adopts

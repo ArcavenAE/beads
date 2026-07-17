@@ -45,6 +45,47 @@ func TestLoadSaveRoundtrip(t *testing.T) {
 	}
 }
 
+func TestBackendConfigRoundtrip(t *testing.T) {
+	beadsDir := t.TempDir()
+
+	cfg := DefaultConfig()
+	cfg.Backend = "contractkv"
+	cfg.BackendConfig = map[string]string{"dsn": "contract://server/db", "schema": "beads_ws"}
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatalf("Save() failed: %v", err)
+	}
+
+	loaded, err := Load(beadsDir)
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+	got := loaded.GetBackendConfig()
+	if len(got) != 2 || got["dsn"] != "contract://server/db" || got["schema"] != "beads_ws" {
+		t.Errorf("BackendConfig round-trip = %v, want %v", got, cfg.BackendConfig)
+	}
+}
+
+func TestBackendConfigOmittedWhenEmpty(t *testing.T) {
+	beadsDir := t.TempDir()
+	if err := DefaultConfig().Save(beadsDir); err != nil {
+		t.Fatalf("Save() failed: %v", err)
+	}
+	data, err := os.ReadFile(ConfigPath(beadsDir))
+	if err != nil {
+		t.Fatalf("read metadata.json: %v", err)
+	}
+	if strings.Contains(string(data), "backend_config") {
+		t.Errorf("empty backend_config serialized into metadata.json: %s", data)
+	}
+	if (&Config{}).GetBackendConfig() != nil {
+		t.Error("GetBackendConfig() on zero config should be nil")
+	}
+	var nilCfg *Config
+	if nilCfg.GetBackendConfig() != nil {
+		t.Error("GetBackendConfig() on nil config should be nil")
+	}
+}
+
 func TestLoadNonexistent(t *testing.T) {
 	tmpDir := t.TempDir()
 

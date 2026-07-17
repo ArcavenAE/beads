@@ -3,6 +3,7 @@ package backends_test
 import (
 	"context"
 	"errors"
+	"maps"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/storage"
@@ -34,6 +35,41 @@ func TestRegisterAndLookup(t *testing.T) {
 	}
 	if !backends.Registered(name) {
 		t.Fatalf("Registered(%q) = false, want true", name)
+	}
+}
+
+func TestProvisionContract(t *testing.T) {
+	const name = "provision-fixture"
+	wantPersist := map[string]string{"dsn": "fixture://server/db", "schema": "beads_ws"}
+	var got backends.ProvisionRequest
+	b := fakeBackend()
+	b.Provision = func(_ context.Context, req backends.ProvisionRequest) (map[string]string, error) {
+		got = req
+		return wantPersist, nil
+	}
+	backends.Register(name, b)
+	t.Cleanup(func() { backends.Deregister(name) })
+
+	reg, ok := backends.Lookup(name)
+	if !ok || reg.Provision == nil {
+		t.Fatalf("Lookup(%q) lost the Provision hook", name)
+	}
+	req := backends.ProvisionRequest{
+		BeadsDir: "/ws/.beads",
+		Options:  map[string]string{"schema": "beads_ws"},
+	}
+	persist, err := reg.Provision(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if got.BeadsDir != req.BeadsDir {
+		t.Errorf("ProvisionRequest.BeadsDir = %q, want %q", got.BeadsDir, req.BeadsDir)
+	}
+	if !maps.Equal(got.Options, req.Options) {
+		t.Errorf("ProvisionRequest.Options = %v, want %v", got.Options, req.Options)
+	}
+	if !maps.Equal(persist, wantPersist) {
+		t.Errorf("persist = %v, want %v", persist, wantPersist)
 	}
 }
 

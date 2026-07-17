@@ -11,14 +11,19 @@ import (
 )
 
 // NewFromConfig opens the SQLite backend for a workspace, reading the database file
-// path from .beads/metadata.json (default beads.db, relative to the beads dir). SQLite
-// is file-based, so there is no DSN password to manage.
+// path from .beads/metadata.json (default beads.db, relative to the beads dir). The
+// legacy sqlite_path field wins so existing workspaces keep opening unchanged; the
+// generic backend_config "path" entry is the fallback spelling. SQLite is file-based,
+// so there is no DSN password to manage.
 func NewFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: load config: %w", err)
 	}
 	path := cfg.GetSQLitePath()
+	if path == "" {
+		path = cfg.GetBackendConfig()[ProvisionOptionPath]
+	}
 	if path == "" {
 		path = "beads.db"
 	}
