@@ -2350,22 +2350,6 @@ func TestBareParentWorktreeCoreCommandsWithoutRedirect(t *testing.T) {
 	}
 }
 
-// initBackendTestEnv returns the process environment with all beads-specific
-// variables (BEADS_*, BD_*) removed and BEADS_DIR pinned to beadsDir. Pinning
-// BEADS_DIR isolates each subtest's workspace and stops bd from walking up into
-// an ambient .beads left by another test or tool; HOME is preserved so bd init's
-// git bootstrap still works.
-func initBackendTestEnv(beadsDir string) []string {
-	var env []string
-	for _, e := range os.Environ() {
-		if strings.HasPrefix(e, "BEADS_") || strings.HasPrefix(e, "BD_") {
-			continue
-		}
-		env = append(env, e)
-	}
-	return append(env, "BEADS_DIR="+beadsDir)
-}
-
 func TestInitBackendFlag(t *testing.T) {
 	bd := buildBDForInitTests(t)
 
@@ -2533,11 +2517,16 @@ func TestInitBackendFlag(t *testing.T) {
 
 	t.Run("backend_opt_malformed", func(t *testing.T) {
 		// "path=a=b" is NOT malformed: values may contain '=' (DSNs with
-		// query parameters); parsing splits at the first '=' only.
-		for _, opt := range []string{"path", "=x.db"} {
-			_, _, out, err := initSQLite(t, "--backend-opt", opt)
-			if err == nil || !strings.Contains(string(out), "--backend-opt") {
-				t.Errorf("malformed --backend-opt %q: err = %v, want parse error, got: %s", opt, err, out)
+		// query parameters); parsing splits at the first '=' only. The
+		// assertions match the parser's distinctive wording so they cannot
+		// pass vacuously against an unrelated flag error.
+		for _, tc := range []struct{ opt, wantErr string }{
+			{"path", "expected key=value"},
+			{"=x.db", "key must be non-empty"},
+		} {
+			_, _, out, err := initSQLite(t, "--backend-opt", tc.opt)
+			if err == nil || !strings.Contains(string(out), tc.wantErr) {
+				t.Errorf("malformed --backend-opt %q: err = %v, want error containing %q, got: %s", tc.opt, err, tc.wantErr, out)
 			}
 		}
 	})
@@ -2571,7 +2560,7 @@ func TestInitBackendFlag(t *testing.T) {
 			cmd.Dir = tmpDir
 			cmd.Env = initBackendTestEnv(beadsDir)
 			out, err := cmd.CombinedOutput()
-			if err == nil || !strings.Contains(string(out), "--backend-opt") {
+			if err == nil || !strings.Contains(string(out), "requires a backend provisioned through the backend registry") {
 				t.Errorf("%v: err = %v, want --backend-opt rejection, got: %s", args, err, out)
 			}
 		}

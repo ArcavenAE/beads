@@ -169,5 +169,12 @@ func TestBuiltinBackendsAreRegistered(t *testing.T) {
 		if !b.WorkspaceIsBeadsDir {
 			t.Errorf("built-in backend %q must report WorkspaceIsBeadsDir for discovery", name)
 		}
+		// The DSN-redacting dedicated init paths are the secrets guarantee
+		// for postgres/mysql: metadata.json only ever gets password-free
+		// DSNs. Any future registry Provision hook for them must redact
+		// before returning persist entries — until then, nil is the pin.
+		if name != configfile.BackendSQLite && b.Provision != nil {
+			t.Errorf("built-in backend %q must not have a registry Provision hook (provisioning goes through its dedicated DSN-redacting init path)", name)
+		}
 	}
 }

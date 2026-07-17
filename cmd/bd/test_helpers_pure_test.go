@@ -340,3 +340,19 @@ func runGitForBootstrapTest(t *testing.T, dir string, args ...string) {
 		t.Fatalf("git %v failed: %v\n%s", args, err, string(output))
 	}
 }
+
+// initBackendTestEnv returns the process environment with all beads-specific
+// variables (BEADS_*, BD_*) removed and BEADS_DIR pinned to beadsDir. Pinning
+// BEADS_DIR isolates each subtest's workspace and stops bd from walking up into
+// an ambient .beads left by another test or tool; HOME is preserved so bd init's
+// git bootstrap still works.
+func initBackendTestEnv(beadsDir string) []string {
+	var env []string
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "BEADS_") || strings.HasPrefix(e, "BD_") {
+			continue
+		}
+		env = append(env, e)
+	}
+	return append(env, "BEADS_DIR="+beadsDir)
+}
