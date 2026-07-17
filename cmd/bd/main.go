@@ -32,12 +32,10 @@ import (
 	"github.com/steveyegge/beads/internal/remotecache"
 	"github.com/steveyegge/beads/internal/routing"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/backends"
 	"github.com/steveyegge/beads/internal/storage/dolt"
-	mysqlstore "github.com/steveyegge/beads/internal/storage/mysql"
 	"github.com/steveyegge/beads/internal/storage/pgdialect"
-	pgstore "github.com/steveyegge/beads/internal/storage/postgres"
 	"github.com/steveyegge/beads/internal/storage/schema"
-	sqlitestore "github.com/steveyegge/beads/internal/storage/sqlite"
 	"github.com/steveyegge/beads/internal/storage/uow"
 	"github.com/steveyegge/beads/internal/telemetry"
 	"github.com/steveyegge/beads/internal/ui"
@@ -992,9 +990,11 @@ var rootCmd = &cobra.Command{
 
 		if dbPath == "" {
 			if bd := beads.FindBeadsDir(); bd != "" {
-				if cfg, _ := configfile.Load(bd); cfg != nil && (cfg.IsDoltProxiedServerMode() || cfg.GetBackend() == configfile.BackendPostgres || cfg.GetBackend() == configfile.BackendMySQL || cfg.GetBackend() == configfile.BackendSQLite) {
-					// A non-Dolt SQL (or proxied-server) workspace has no local Dolt
-					// database file; the .beads dir with metadata.json IS the workspace.
+				if cfg, _ := configfile.Load(bd); cfg != nil && (cfg.IsDoltProxiedServerMode() || registeredBackendWorkspaceIsBeadsDir(cfg)) {
+					// A registered backend whose workspace IS the .beads
+					// directory (the SQL-family backends) — or a proxied-server
+					// workspace — has no local Dolt database file; the .beads
+					// dir with metadata.json IS the workspace.
 					dbPath = bd
 				}
 			}
@@ -1275,16 +1275,19 @@ var rootCmd = &cobra.Command{
 		// Removing them WILL cause unrecoverable data corruption and data loss.
 		// Dolt manages these files itself; external interference is never safe.
 
-		if cfg != nil && cfg.GetBackend() == configfile.BackendPostgres {
-			// Postgres backend: open via the SQL-family bundle, bypassing the
-			// Dolt open path (the doltCfg above is built but unused here).
-			store, err = pgstore.NewFromConfig(rootCtx, beadsDir)
-		} else if cfg != nil && cfg.GetBackend() == configfile.BackendMySQL {
-			// MySQL backend: same SQL-family bundle, isolation by database.
-			store, err = mysqlstore.NewFromConfig(rootCtx, beadsDir)
-		} else if cfg != nil && cfg.GetBackend() == configfile.BackendSQLite {
-			// SQLite backend: pure-Go file-based SQL-family bundle.
-			store, err = sqlitestore.NewFromConfig(rootCtx, beadsDir)
+		if backend, ok := backends.Lookup(cfg.GetBackend()); ok {
+			// Registered backend (SQLite, PostgreSQL, MySQL): the registry
+			// owns this open, bypassing the Dolt open path (the doltCfg
+			// above is built but unused here). The Dolt family stays
+			// literal — embedded and server modes go through newDoltStore
+			// below, and proxied-server already short-circuited to the UOW
+			// provider above — because the registry is for
+			// storage.DoltStorage-returning backends only.
+			if useReadOnly {
+				store, err = backend.OpenReadOnly(rootCtx, beadsDir)
+			} else {
+				store, err = backend.Open(rootCtx, beadsDir)
+			}
 		} else {
 			store, err = newDoltStore(rootCtx, doltCfg)
 		}
