@@ -11,18 +11,22 @@
 // credentials, and — for proxied-server — a unit-of-work provider rather
 // than a store, so it stays hand-written in cmd/bd.
 //
-// This package must stay import-light (internal/storage and stdlib only):
-// internal/configfile consults the registry for backend classification, and
-// registrants typically import internal/configfile, so any heavier imports
-// here would create cycles.
+// Backend classification in internal/configfile consults the registered
+// name set through the backendnames leaf package (mirrored by
+// Register/Deregister below), so configfile never imports this package or
+// the storage interface surface behind it. Registrants typically import
+// internal/configfile for the name constants, so imports here must stay
+// light (internal/storage and stdlib) to keep that edge acyclic.
 package backends
 
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/backendnames"
 )
 
 // ProvisionRequest carries the inputs to a backend's Provision hook. It is
@@ -55,6 +59,12 @@ type Backend struct {
 	// set of backend-specific config entries the backend wants recorded in
 	// metadata.json for later opens; empty/nil is fine. May be nil for
 	// backends that bd init cannot provision.
+	//
+	// persist entries are written to metadata.json, which is typically
+	// committed to git: they must NEVER contain credentials. A backend whose
+	// options carry a credentialed DSN must redact it before returning (the
+	// dedicated postgres/mysql init paths persist password-free DSNs and
+	// resolve secrets from the environment at open time — same rule here).
 	Provision func(ctx context.Context, req ProvisionRequest) (persist map[string]string, err error)
 
 	// WorkspaceIsBeadsDir reports that the .beads directory itself is the
@@ -93,6 +103,11 @@ func Register(name string, b Backend) {
 		panic(fmt.Sprintf("backends: backend %q registered twice", name))
 	}
 	registry[name] = b
+	// Mirror the name into the leaf name-set so internal/configfile can
+	// classify without importing this package (and the storage interface
+	// surface behind it). Register/Deregister are the only writers, so the
+	// set cannot drift from the registry.
+	backendnames.Add(name)
 }
 
 // Deregister removes name from the registry, reporting whether it was
@@ -104,6 +119,7 @@ func Deregister(name string) bool {
 	defer mu.Unlock()
 	_, ok := registry[name]
 	delete(registry, name)
+	backendnames.Remove(name)
 	return ok
 }
 
@@ -121,4 +137,21 @@ func Registered(name string) bool {
 	defer mu.RUnlock()
 	_, ok := registry[name]
 	return ok
+}
+
+// Provisionable returns the sorted names of registered backends that have a
+// Provision hook — the set `bd init` can provision through the registry.
+// Callers use it to keep user-facing guidance truthful as registrants come
+// and go, instead of hardcoding backend names.
+func Provisionable() []string {
+	mu.RLock()
+	defer mu.RUnlock()
+	var names []string
+	for name, b := range registry {
+		if b.Provision != nil {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }

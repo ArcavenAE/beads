@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/config"
-	"github.com/steveyegge/beads/internal/storage/backends"
+	"github.com/steveyegge/beads/internal/storage/backendnames"
 )
 
 const ConfigFileName = "metadata.json"
@@ -55,6 +55,8 @@ type Config struct {
 	// internal/storage/backends). Keys and meanings are owned by the backend
 	// that wrote them; bd core only round-trips the map. The SQLite database
 	// path stays in the legacy sqlite_path field above for compatibility.
+	// metadata.json is typically committed to git: entries must never
+	// contain credentials (see the Provision doc in internal/storage/backends).
 	BackendConfig map[string]string `json:"backend_config,omitempty"`
 
 	// Project identity — unique ID generated at bd init time.
@@ -263,6 +265,10 @@ func (c *Config) GetCapabilities() BackendCapabilities {
 // time, so an out-of-tree registrant's name is honored without editing this
 // file). "", "dolt", and unregistered unknown values resolve to dolt so the
 // default path stays byte-identical and a typo fails safe to Dolt.
+//
+// The registry consult goes through the backendnames leaf set (kept in
+// lockstep by backends.Register/Deregister) so this package classifies by
+// string membership without importing the storage interface surface.
 func (c *Config) GetBackend() string {
 	if c != nil {
 		switch c.Backend {
@@ -271,7 +277,7 @@ func (c *Config) GetBackend() string {
 		case "", BackendDolt:
 			return BackendDolt
 		}
-		if backends.Registered(c.Backend) {
+		if backendnames.Has(c.Backend) {
 			return c.Backend
 		}
 	}
