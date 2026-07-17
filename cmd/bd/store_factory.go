@@ -15,9 +15,6 @@ import (
 	"github.com/steveyegge/beads/internal/storage/dbproxy/util"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
-	beadsmysql "github.com/steveyegge/beads/internal/storage/mysql"
-	"github.com/steveyegge/beads/internal/storage/postgres"
-	beadssqlite "github.com/steveyegge/beads/internal/storage/sqlite"
 )
 
 func usesSQLServer() bool {
@@ -94,43 +91,12 @@ func acquireEmbeddedLock(beadsDir string, serverMode bool) (util.Unlocker, error
 	return lock, nil
 }
 
-// newDoltStoreFromConfig creates a storage backend from the beads directory's
-// persisted metadata.json configuration. Uses embedded Dolt by default;
-// connects to dolt sql-server when dolt_mode is "server".
+// openEmbeddedStoreFromConfig opens the embedded Dolt database selected by
+// the metadata-driven ladder in store_factory_config.go.
 //
-// For embedded mode, legacy hyphenated database names (pre-GH#2142) are
-// auto-sanitized to underscores and the fix is persisted to metadata.json.
-func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
-	cfg, err := configfile.Load(beadsDir)
-	if err != nil {
-		// A present-but-unloadable metadata.json must not degrade to the
-		// embedded default: on server-mode deployments the embedded
-		// directory is an empty relic, and opening it silently turns every
-		// query into an empty result set with exit 0 (false-empty). Absent
-		// metadata.json (cfg == nil, err == nil) keeps the embedded default.
-		return nil, fmt.Errorf("load %s: %w (refusing to fall back to the embedded store)", configfile.ConfigPath(beadsDir), err)
-	}
-	if cfg != nil && cfg.GetBackend() == configfile.BackendPostgres {
-		return postgres.NewFromConfig(ctx, beadsDir)
-	}
-	if cfg != nil && cfg.GetBackend() == configfile.BackendMySQL {
-		return beadsmysql.NewFromConfig(ctx, beadsDir)
-	}
-	if cfg != nil && cfg.GetBackend() == configfile.BackendSQLite {
-		return beadssqlite.NewFromConfig(ctx, beadsDir)
-	}
-	if cfg != nil && cfg.IsDoltProxiedServerMode() {
-		// TODO: this needs to be uow provider
-		return nil, fmt.Errorf("proxy server store should be uow provider")
-		// 	return newProxiedServerStore(ctx, &dolt.Config{
-		// 		BeadsDir:      beadsDir,
-		// 		Database:      cfg.GetDoltDatabase(),
-		// 		ProxiedServer: true,
-		// 	})
-	}
-	if cfg != nil && cfg.IsDoltServerMode() {
-		return dolt.NewFromConfig(ctx, beadsDir)
-	}
+// Legacy hyphenated database names (pre-GH#2142) are auto-sanitized to
+// underscores and the fix is persisted to metadata.json.
+func openEmbeddedStoreFromConfig(ctx context.Context, beadsDir string, cfg *configfile.Config) (storage.DoltStorage, error) {
 	database := configfile.DefaultDoltDatabase
 	if cfg != nil {
 		database = cfg.GetDoltDatabase()
@@ -184,46 +150,13 @@ func migrateHyphenatedDB(beadsDir string, cfg *configfile.Config, oldName, newNa
 	return nil
 }
 
-// newReadOnlyStoreFromConfig creates a read-only storage backend from the beads
-// directory's persisted metadata.json configuration.
+// openEmbeddedReadOnlyStoreFromConfig opens the embedded Dolt database for a
+// read-only command.
 //
-// For embedded mode, invalid characters (hyphens, dots) are sanitized in-memory
-// only — no directory renames or metadata.json writes. This prevents cross-repo
+// Invalid characters (hyphens, dots) are sanitized in-memory only — no
+// directory renames or metadata.json writes. This prevents cross-repo
 // hydration from mutating foreign projects (GH#3231).
-func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
-	cfg, err := configfile.Load(beadsDir)
-	if err != nil {
-		// Same contract as newDoltStoreFromConfig: a present-but-unloadable
-		// metadata.json is a hard error, not a silent embedded fallback —
-		// and the error must name the real cause rather than the downstream
-		// "database not found" the embedded open would produce.
-		return nil, fmt.Errorf("load %s: %w (refusing to fall back to the embedded store)", configfile.ConfigPath(beadsDir), err)
-	}
-	if cfg != nil && cfg.GetBackend() == configfile.BackendPostgres {
-		// Postgres has no read-only open mode in the wedge; a normal open is fine
-		// (reads don't mutate, and search_path is per-workspace).
-		return postgres.NewFromConfig(ctx, beadsDir)
-	}
-	if cfg != nil && cfg.GetBackend() == configfile.BackendMySQL {
-		// MySQL likewise has no separate read-only open in the wedge; reads don't mutate.
-		return beadsmysql.NewFromConfig(ctx, beadsDir)
-	}
-	if cfg != nil && cfg.GetBackend() == configfile.BackendSQLite {
-		return beadssqlite.NewFromConfig(ctx, beadsDir)
-	}
-	if cfg != nil && cfg.IsDoltProxiedServerMode() {
-		// TODO: this needs to be uow provider
-		return nil, fmt.Errorf("proxy server store needs to be uow provider")
-		// return newProxiedServerStore(ctx, &dolt.Config{
-		// 	BeadsDir:      beadsDir,
-		// 	Database:      cfg.GetDoltDatabase(),
-		// 	ProxiedServer: true,
-		// 	ReadOnly:      true,
-		// })
-	}
-	if cfg != nil && cfg.IsDoltServerMode() {
-		return dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
-	}
+func openEmbeddedReadOnlyStoreFromConfig(ctx context.Context, beadsDir string, cfg *configfile.Config) (storage.DoltStorage, error) {
 	database := configfile.DefaultDoltDatabase
 	if cfg != nil {
 		database = cfg.GetDoltDatabase()
