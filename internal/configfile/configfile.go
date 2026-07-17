@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/storage/backends"
 )
 
 const ConfigFileName = "metadata.json"
@@ -249,19 +250,22 @@ func (c *Config) GetCapabilities() BackendCapabilities {
 	return CapabilitiesForBackend(backend)
 }
 
-// GetBackend returns the configured storage backend. Only the explicitly-allowlisted
-// non-default backends ("postgres", "mysql") are honored; "", "dolt", and any legacy
-// or unknown value resolve to dolt so the default path stays byte-identical and a
-// typo fails safe to Dolt.
+// GetBackend returns the configured storage backend: a built-in SQL-family
+// name ("postgres", "mysql", "sqlite"), or any name registered in
+// internal/storage/backends (additional backends register themselves at init
+// time, so an out-of-tree registrant's name is honored without editing this
+// file). "", "dolt", and unregistered unknown values resolve to dolt so the
+// default path stays byte-identical and a typo fails safe to Dolt.
 func (c *Config) GetBackend() string {
 	if c != nil {
 		switch c.Backend {
-		case BackendPostgres:
-			return BackendPostgres
-		case BackendMySQL:
-			return BackendMySQL
-		case BackendSQLite:
-			return BackendSQLite
+		case BackendPostgres, BackendMySQL, BackendSQLite:
+			return c.Backend
+		case "", BackendDolt:
+			return BackendDolt
+		}
+		if backends.Registered(c.Backend) {
+			return c.Backend
 		}
 	}
 	return BackendDolt
