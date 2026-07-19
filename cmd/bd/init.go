@@ -90,6 +90,14 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				restoreChangeDirSelection()
 			}
 		}()
+		migrationProjectID, err := migrationV062InitProjectID(cmd, admission)
+		if err != nil {
+			return err
+		}
+		migrationRepositoryRoot, err := migrationV062InitRepositoryRoot(cmd, migrationProjectID)
+		if err != nil {
+			return err
+		}
 		if err := prepareInitContextAfterBackendPreflight(cmd, admission); err != nil {
 			return err
 		}
@@ -1191,25 +1199,49 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		}
 
 		// Compute and store repository fingerprint (FR-015)
-		repoID, err := beads.ComputeRepoID()
+		var repoID string
+		if migrationRepositoryRoot != "" {
+			repoID, err = beads.ComputeRepoIDForPath(migrationRepositoryRoot)
+		} else {
+			repoID, err = beads.ComputeRepoID()
+		}
 		if err != nil {
+			if migrationRepositoryRoot != "" {
+				return fmt.Errorf("failed to compute authenticated migration repository ID: %v", err)
+			}
 			if !quiet {
 				fmt.Fprintf(os.Stderr, "Warning: could not compute repository ID: %v\n", err)
 			}
 		} else {
-			if verifyMetadata(ctx, store, "repo_id", repoID) && !quiet {
+			persisted := verifyMetadata(ctx, store, "repo_id", repoID)
+			if migrationRepositoryRoot != "" && !persisted {
+				return fmt.Errorf("authenticated migration repository ID did not persist")
+			}
+			if persisted && !quiet {
 				fmt.Printf("  Repository ID: %s\n", repoID[:8])
 			}
 		}
 
 		// Compute and store clone-specific ID (FR-016: skip on failure)
-		cloneID, err := beads.GetCloneID()
+		var cloneID string
+		if migrationRepositoryRoot != "" {
+			cloneID, err = beads.GetCloneIDForPath(migrationRepositoryRoot)
+		} else {
+			cloneID, err = beads.GetCloneID()
+		}
 		if err != nil {
+			if migrationRepositoryRoot != "" {
+				return fmt.Errorf("failed to compute authenticated migration clone ID: %v", err)
+			}
 			if !quiet {
 				fmt.Fprintf(os.Stderr, "Warning: could not compute clone ID: %v\n", err)
 			}
 		} else {
-			if verifyMetadata(ctx, store, "clone_id", cloneID) && !quiet {
+			persisted := verifyMetadata(ctx, store, "clone_id", cloneID)
+			if migrationRepositoryRoot != "" && !persisted {
+				return fmt.Errorf("authenticated migration clone ID did not persist")
+			}
+			if persisted && !quiet {
 				fmt.Printf("  Clone ID: %s\n", cloneID)
 			}
 		}
@@ -1243,8 +1275,19 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			// minting a new one and writing it back would overwrite the
 			// source identity and cause cross-project verification to
 			// fail on subsequent pulls.
+			if migrationProjectID != "" && cfg.ProjectID != "" && cfg.ProjectID != migrationProjectID {
+				return fmt.Errorf("--%s conflicts with an existing project identity", migrationV062ProjectIDFlag)
+			}
 			if cfg.ProjectID == "" {
-				if store != nil && (database != "" || bootstrappedFromRemote) {
+				if migrationProjectID != "" {
+					if store != nil {
+						existingID, readErr := store.GetMetadata(ctx, "_project_id")
+						if readErr == nil && existingID != "" && existingID != migrationProjectID {
+							return fmt.Errorf("--%s conflicts with the target database identity", migrationV062ProjectIDFlag)
+						}
+					}
+					cfg.ProjectID = migrationProjectID
+				} else if store != nil && (database != "" || bootstrappedFromRemote) {
 					if existingID, err := store.GetMetadata(ctx, "_project_id"); err == nil && existingID != "" {
 						cfg.ProjectID = existingID
 						if !quiet {
@@ -1316,6 +1359,9 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			}
 
 			if err := cfg.Save(beadsDir); err != nil {
+				if migrationProjectID != "" {
+					return fmt.Errorf("failed to persist authenticated v0.62 project identity: %v", err)
+				}
 				fmt.Fprintf(os.Stderr, "Warning: failed to create metadata.json: %v\n", err)
 				// Non-fatal - continue anyway
 			}
@@ -1323,7 +1369,15 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			// Write project identity to database for cross-project verification (GH#2372)
 			if cfg.ProjectID != "" && store != nil {
 				if err := store.SetMetadata(ctx, "_project_id", cfg.ProjectID); err != nil {
+					if migrationProjectID != "" {
+						return fmt.Errorf("failed to persist authenticated v0.62 database identity: %v", err)
+					}
 					fmt.Fprintf(os.Stderr, "Warning: failed to write project ID to database: %v\n", err)
+				} else if migrationProjectID != "" {
+					persisted, readErr := store.GetMetadata(ctx, "_project_id")
+					if readErr != nil || persisted != migrationProjectID {
+						return fmt.Errorf("authenticated v0.62 database identity did not persist")
+					}
 				}
 			}
 
@@ -2164,6 +2218,10 @@ func init() {
 	initCmd.Flags().String("mysql-url", "", "MySQL server DSN (with --backend=mysql), e.g. user:pass@tcp(host:3306)/ . A password may be included for init but is never persisted; set BEADS_MYSQL_PASSWORD for later commands. Falls back to BEADS_MYSQL_URL.")
 	initCmd.Flags().String("mysql-database", "", "MySQL database for this workspace (with --backend=mysql; MySQL's isolation unit)")
 	initCmd.Flags().String("sqlite-path", "", "SQLite database file (with --backend=sqlite; relative to the beads dir, default beads.db)")
+	initCmd.Flags().String(migrationV062ProjectIDFlag, "", "Authenticated project identity for the v0.62 migration bridge")
+	_ = initCmd.Flags().MarkHidden(migrationV062ProjectIDFlag)
+	initCmd.Flags().String(migrationV062RepositoryRootFlag, "", "Final repository root for the v0.62 migration bridge")
+	_ = initCmd.Flags().MarkHidden(migrationV062RepositoryRootFlag)
 
 	// Dolt server connection flags
 	initCmd.Flags().Bool("server", false, "Use external dolt sql-server instead of embedded engine")

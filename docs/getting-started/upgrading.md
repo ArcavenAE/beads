@@ -244,16 +244,25 @@ Identify your installation's era by what lives under `.beads/`:
 
 | Era | Storage layout |
 |---|---|
-| SQLite (pre-Dolt, up to ~v0.50) | `.beads/beads.db` |
-| Dolt server | `.beads/dolt/` |
-| Embedded Dolt (the default since its introduction) | `.beads/embeddeddolt/` |
-### From v0.63.3+ (current era)
+| SQLite (default through v0.49.x; selectable later) | `.beads/beads.db` |
+| Dolt server (common/default in v0.50.x-v0.62.x) | `.beads/dolt/` |
+| Embedded Dolt (selectable earlier; default from v0.63.x) | `.beads/embeddeddolt/` |
+
+Route by the observed storage layout, not the version alone. Some historical
+releases allowed more than one backend.
+
+### From v0.63.3+ embedded-Dolt workspaces
 
 Upgrade the binary and run:
 
 ```bash
 bd migrate
 ```
+
+The pinned embedded-era qualification begins at the official v0.63.3 release.
+For an embedded layout created by an earlier binary, preserve the matching
+binary and a complete `.beads` backup rather than assuming this direct path is
+qualified.
 
 If the project was initialized before `bd init` automatically wired git origin
 as the Dolt remote, verify the remote after upgrading:
@@ -274,38 +283,84 @@ bd dolt push
 Commit the resulting `.beads/config.yaml` change so other clones can run
 `bd bootstrap` or `bd dolt pull`.
 
-### From v0.59–v0.63.2 (old embedded)
+### From v0.50.x-v0.62.x Dolt-server workspaces
 
-Direct upgrade works automatically:
+Releases in this range commonly used an external Dolt SQL server, including
+v0.59-v0.62. Current `bd` refuses to open this storage layout until an explicit
+version-specific bridge is used; an ordinary command such as `bd list` will not
+convert it automatically.
+
+The refusal is intentional. Opening the server-era layout directly can rewrite
+version markers or storage state before the old data has been exported. Do not
+delete `.beads/dolt`, remove metadata, or run `bd init` over the only copy.
+
+Before changing binaries:
+
+1. Keep the matching historical `bd` binary and Dolt runtime available.
+2. Stop all writes and stop the historical server.
+3. Preserve and verify a byte-for-byte copy of the complete `.beads` directory
+   before running any extraction command.
+4. Restart the historical stack only against a separate working copy, then make
+   the release-specific export and any supplemental per-issue snapshots there.
+5. Revalidate the sealed rollback copy, and retain it until issue counts,
+   fields, comments, labels, and dependency edges have been verified.
+
+#### Qualified v0.62.0 bridge (Linux)
+
+The repository now includes a user-facing bridge for one deliberately narrow
+v0.62.0 shape. It accepts exactly the five-record qualification corpus covering
+eight features: epic, task, bug, dependency, standalone rich fields, closed
+state, label, and comment. A different record count, an unsupported top-level
+or nested field, a different historical release, or an unsafe layout is refused
+before cutover. This is not yet a general converter for arbitrary v0.62 data.
+
+Stop the historical server and every writer first. Keep checksum-verified copies
+of the exact v0.62.0 `bd` binary and Dolt 1.84.0 runtime, then inspect without
+workspace effects:
 
 ```bash
-# Just use the new binary — it handles the conversion
-bd list
+workspace=$(realpath /path/to/project)
+target_bd=$(realpath /path/to/current/bd)
+source_bd=$(realpath /path/to/bd-v0.62.0)
+source_dolt=$(realpath /path/to/dolt-1.84.0)
+
+./scripts/migrate-v062-server-to-current.sh \
+  --inspect --json \
+  --workspace "$workspace" \
+  --target-bd "$target_bd" \
+  --source-bd "$source_bd" \
+  --source-dolt "$source_dolt" \
+  > /tmp/beads-v062-plan.json
+
+plan=$(jq -er '.plan.digest' /tmp/beads-v062-plan.json)
 ```
 
-### From v0.50–v0.58 (Dolt server era)
-
-The old binary used an external Dolt SQL server. The new binary uses an embedded engine.
+Review the plan, keep the historical server stopped, and explicitly apply that
+exact digest:
 
 ```bash
-# 1. Export your data while the old binary still works
-bd list --json -n 0 --all > .beads/issues.jsonl
-
-# 2. Stop the Dolt server
-# stop the dolt sql-server process (kill its PID; there is no --stop flag)
-
-# 3. Remove stale server metadata and old storage directories
-rm -f .beads/metadata.json .beads/config.json
-rm -rf .beads/dolt .beads/embeddeddolt
-
-# 4. Initialize with the new binary
-bd init --from-jsonl --quiet
-
-# 5. Verify
-bd list --all
+./scripts/migrate-v062-server-to-current.sh \
+  --apply --yes --json --expect-plan "$plan" \
+  --workspace "$workspace" \
+  --target-bd "$target_bd" \
+  --source-bd "$source_bd" \
+  --source-dolt "$source_dolt"
 ```
 
-### From v0.30–v0.50 (SQLite era)
+Apply retains the complete historical source at
+`.beads-v0.62.0-rollback` and publishes the verified embedded target at
+`.beads`. It is never automatic. Re-running the same consent-bound plan after
+success verifies the receipt-backed target and returns a no-op; an authenticated
+interrupted cutover is recovered on retry, while ambiguous state is preserved
+for manual recovery.
+
+For other v0.50.x-v0.62.x shapes, keep using the matching historical binary.
+The migration CI recipes are qualification infrastructure, not supported
+commands for arbitrary databases. A generic `list --json` export is not a
+lossless substitute because historical release shapes can omit comments,
+labels, or dependency details.
+
+### From v0.30.x-v0.50.x SQLite workspaces
 
 The old binary stored data in SQLite. The new binary uses Dolt.
 

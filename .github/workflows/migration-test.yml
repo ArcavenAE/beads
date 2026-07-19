@@ -1,6 +1,11 @@
 name: Migration Test Harness
 
 on:
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'website/**'
   push:
     tags: ['v*']
   workflow_dispatch:
@@ -19,14 +24,250 @@ on:
           - direct-only
           - stepping-only
 
+permissions:
+  contents: read
+
 env:
   BD_DISABLE_METRICS: "1"
   BD_DISABLE_EVENT_FLUSH: "1"
 
 jobs:
+  migration-test-plan:
+    name: Validate and plan migration lanes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      has-supplemental-work: ${{ steps.plan.outputs.has_supplemental_work }}
+      supplemental-versions: ${{ steps.plan.outputs.supplemental_versions }}
+      run-stepping: ${{ steps.plan.outputs.run_stepping }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+
+      - name: Validate ownership and classify supplemental work
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_MODE: ${{ github.event.inputs.mode }}
+          REQUESTED_VERSIONS: ${{ github.event.inputs.versions }}
+        run: |
+          set -euo pipefail
+          source scripts/migration-test/lib/versions.sh
+
+          mapfile -t matrix_versions < <(
+            awk '
+              /^  historical-upgrades:/ { in_historical = 1; next }
+              in_historical && /^    steps:/ { exit }
+              in_historical && $1 == "version:" { print $2 }
+            ' .github/workflows/migration-test.yml | sort -V
+          )
+          mapfile -t manifest_versions < <(
+            printf '%s\n' "${!STRICT_EXPECTED_STATUSES[@]}" | sort -V
+          )
+          if ! diff -u \
+              <(printf '%s\n' "${manifest_versions[@]}") \
+              <(printf '%s\n' "${matrix_versions[@]}"); then
+            echo "::error::strict workflow matrix and qualification manifest disagree"
+            exit 1
+          fi
+
+          has_supplemental_work=false
+          run_stepping=false
+          supplemental_versions=()
+
+          classify_version() {
+            local version="$1"
+            if [[ ! "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::versions must be space-separated vMAJOR.MINOR.PATCH releases"
+              return 1
+            fi
+            if strict_expected_status "$version" >/dev/null 2>&1; then
+              echo "$version is owned by its pinned strict qualification lane"
+            else
+              supplemental_versions+=("$version")
+              has_supplemental_work=true
+            fi
+          }
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            mode="${REQUESTED_MODE:-all}"
+            case "$mode" in
+              all|direct-only|stepping-only) ;;
+              *)
+                echo "::error::invalid migration test mode"
+                exit 1
+                ;;
+            esac
+
+            if [ -n "$REQUESTED_VERSIONS" ]; then
+              if [[ "$REQUESTED_VERSIONS" == *$'\n'* ]]; then
+                echo "::error::versions must be provided on one line"
+                exit 1
+              fi
+              read -r -a requested_versions <<< "$REQUESTED_VERSIONS"
+              if [ "${#requested_versions[@]}" -eq 0 ]; then
+                echo "::error::versions must include at least one release"
+                exit 1
+              fi
+              # Explicit versions have always selected direct paths regardless
+              # of mode; preserve that workflow_dispatch contract.
+              for version in "${requested_versions[@]}"; do
+                classify_version "$version"
+              done
+            else
+              if [ "$mode" != "stepping-only" ]; then
+                for version in "${DIRECT_PATHS[@]}"; do
+                  classify_version "$version"
+                done
+              fi
+              if [ "$mode" != "direct-only" ] && [ "${#STEPPING_STONE_PATHS[@]}" -gt 0 ]; then
+                run_stepping=true
+                has_supplemental_work=true
+              fi
+            fi
+          fi
+
+          {
+            printf 'has_supplemental_work=%s\n' "$has_supplemental_work"
+            printf 'supplemental_versions=%s\n' "${supplemental_versions[*]}"
+            printf 'run_stepping=%s\n' "$run_stepping"
+          } >> "$GITHUB_OUTPUT"
+
+  historical-upgrades:
+    name: ${{ matrix.qualification }} upgrade qualification
+    # Every direct release with a strict manifest is owned by this matrix on
+    # every CI trigger. Manual stepping-only runs remain available without
+    # paying for direct qualifications unless explicit versions were supplied.
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'stepping-only' || github.event.inputs.versions != '' }}
+    # v0.55.4 and v0.63.3 are dynamically linked against ICU 74.
+    # Pin the image and install that runtime explicitly so a runner alias
+    # update cannot invalidate either historical fixture.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - qualification: SQLite v0.49.6
+            version: v0.49.6
+            expected: MANUAL
+            cache-identity: sqlite-v0.49.6-8546dc9a47e11dc31ac2bc9a0224a9c690975e91850932cbb62623053fbb7db8
+          - qualification: Legacy Dolt-dir v0.55.4
+            version: v0.55.4
+            expected: MANUAL
+            cache-identity: legacy-dolt-v0.55.4-e0fa25456dd82890230eef17653448a0bf995104c78864be91c5ed84426a5f49
+          - qualification: Legacy Dolt-dir v0.57.0
+            version: v0.57.0
+            expected: MANUAL
+            cache-identity: legacy-dolt-v0.57.0-f8629d5627bed7d25f06f92334addc171d679f9aed9d08c5d42a9684205dc04b
+          - qualification: Dolt server v0.62.0
+            version: v0.62.0
+            expected: MANUAL
+            cache-identity: dolt-server-v0.62.0-4cca7265b22e5c3ca8d62ab0b9752bec31f68b7f5fa636282a4c7e5454c35535
+          - qualification: Embedded Dolt v0.63.3
+            version: v0.63.3
+            expected: AUTO
+            cache-identity: embedded-dolt-v0.63.3-5f4efd2e010209b3f381dbcd783b2a3a652f50ea72f40ef04c8ba434d408bf9e
+    steps:
+      - name: Select requested qualification
+        id: selection
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_VERSIONS: ${{ github.event.inputs.versions }}
+          HISTORICAL_VERSION: ${{ matrix.version }}
+        run: |
+          selected=true
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$REQUESTED_VERSIONS" ]; then
+            selected=false
+            read -r -a requested_versions <<< "$REQUESTED_VERSIONS"
+            for version in "${requested_versions[@]}"; do
+              if [ "$version" = "$HISTORICAL_VERSION" ]; then
+                selected=true
+                break
+              fi
+            done
+          fi
+          printf 'selected=%s\n' "$selected" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        if: steps.selection.outputs.selected == 'true'
+
+      - name: Set up Go
+        if: steps.selection.outputs.selected == 'true'
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Install test dependencies
+        if: steps.selection.outputs.selected == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq sqlite3 libicu74
+
+      - name: Install pinned Dolt runtime
+        if: steps.selection.outputs.selected == 'true'
+        env:
+          HISTORICAL_VERSION: ${{ matrix.version }}
+        run: |
+          source scripts/migration-test/lib/versions.sh
+          if ! DOLT_VERSION=$(strict_required_dolt_version "$HISTORICAL_VERSION"); then
+            echo "No external Dolt runtime required for $HISTORICAL_VERSION"
+            exit 0
+          fi
+          DOLT_SHA256=$(strict_required_dolt_sha256 "$HISTORICAL_VERSION" linux amd64)
+          archive="$RUNNER_TEMP/dolt-linux-amd64.tar.gz"
+          extract_dir="$RUNNER_TEMP/dolt-${DOLT_VERSION}"
+          curl --fail --location --silent --show-error --retry 3 \
+            "https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-linux-amd64.tar.gz" \
+            --output "$archive"
+          printf '%s  %s\n' "$DOLT_SHA256" "$archive" | sha256sum --check --strict
+          mkdir -p "$extract_dir"
+          tar -xzf "$archive" -C "$extract_dir"
+          dolt_bin=$(find "$extract_dir" -type f -path '*/bin/dolt' -print -quit)
+          test -n "$dolt_bin"
+          sudo install -m 0755 "$dolt_bin" /usr/local/bin/dolt
+          test "$(dolt version | head -1)" = "dolt version ${DOLT_VERSION}"
+
+      - name: Configure Git
+        if: steps.selection.outputs.selected == 'true'
+        run: |
+          git config --global user.name "CI Bot"
+          git config --global user.email "ci@beads.test"
+
+      - name: Cache pinned historical release
+        if: steps.selection.outputs.selected == 'true'
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: ~/.cache/beads-regression
+          key: migration-${{ matrix.cache-identity }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build candidate
+        if: steps.selection.outputs.selected == 'true'
+        run: make build
+
+      - name: Verify public v0.62 migration bridge
+        if: steps.selection.outputs.selected == 'true' && matrix.version == 'v0.62.0'
+        env:
+          PUBLIC_V062_REAL_TARGET_BD: ./bd
+        run: ./scripts/migration-test/public-v062-bridge-test.sh
+
+      - name: Verify strict harness guards
+        if: steps.selection.outputs.selected == 'true'
+        run: ./scripts/migration-test/strict-mode-test.sh
+
+      - name: Qualify ${{ matrix.qualification }} upgrade
+        if: steps.selection.outputs.selected == 'true'
+        env:
+          CANDIDATE_BIN: ./bd
+          GIT_CONFIG_NOSYSTEM: "1"
+          EXPECTED_STATUS: ${{ matrix.expected }}
+          HISTORICAL_VERSION: ${{ matrix.version }}
+        run: ./scripts/migration-test/run.sh --strict --expect "$EXPECTED_STATUS" "$HISTORICAL_VERSION"
+
   migration-test:
-    name: Migration fidelity
-    runs-on: ubuntu-latest
+    name: Manual supplemental migration fidelity
+    needs: migration-test-plan
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.migration-test-plan.outputs.has-supplemental-work == 'true' }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
@@ -43,7 +284,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq sqlite3
 
-      - name: Install Dolt
+      - name: Install current Dolt for ad-hoc paths
         run: |
           curl -fsSL https://github.com/dolthub/dolt/releases/latest/download/install.sh | sudo bash
           dolt version
@@ -66,15 +307,21 @@ jobs:
         env:
           CANDIDATE_BIN: ./bd
           GIT_CONFIG_NOSYSTEM: "1"
+          RUN_STEPPING: ${{ needs.migration-test-plan.outputs.run-stepping }}
+          SUPPLEMENTAL_VERSIONS: ${{ needs.migration-test-plan.outputs.supplemental-versions }}
         run: |
-          ARGS=""
-          if [ "${{ github.event.inputs.mode }}" = "direct-only" ]; then
-            ARGS="--direct-only"
-          elif [ "${{ github.event.inputs.mode }}" = "stepping-only" ]; then
-            ARGS="--stepping-only"
+          set -euo pipefail
+          ran_supplemental_work=false
+          if [ -n "$SUPPLEMENTAL_VERSIONS" ]; then
+            read -r -a supplemental_versions <<< "$SUPPLEMENTAL_VERSIONS"
+            ./scripts/migration-test/run.sh "${supplemental_versions[@]}"
+            ran_supplemental_work=true
           fi
-          if [ -n "${{ github.event.inputs.versions }}" ]; then
-            ./scripts/migration-test/run.sh ${{ github.event.inputs.versions }}
-          else
-            ./scripts/migration-test/run.sh $ARGS
+          if [ "$RUN_STEPPING" = "true" ]; then
+            ./scripts/migration-test/run.sh --stepping-only
+            ran_supplemental_work=true
           fi
+          $ran_supplemental_work || {
+            echo "::error::supplemental migration job was provisioned without planned work"
+            exit 1
+          }

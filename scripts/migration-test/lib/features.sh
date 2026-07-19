@@ -71,7 +71,12 @@ create_dataset() {
 
     # 2. Task (will be child of epic if supported)
     local task_args=(--title "Migration task alpha" --type task --priority 1)
-    if try_feature "parent_child" "$version" "$ws" "$bin" create --silent --title "__probe__" --parent "$epic_id" --type task; then
+    if ${STRICT_MODE:-false}; then
+        # Qualified strict fixtures require this relationship. Construct it
+        # directly so a stale feature cache or a retained probe cannot turn a
+        # broken source fixture into an apparent fidelity pass.
+        task_args+=(--parent "$epic_id")
+    elif try_feature "parent_child" "$version" "$ws" "$bin" create --silent --title "__probe__" --parent "$epic_id" --type task; then
         task_args+=(--parent "$epic_id")
         # clean up probe issue — best effort
         bd_in "$ws" "$bin" close "$(__last_created_id "$ws" "$bin")" 2>/dev/null || true
@@ -106,7 +111,15 @@ create_dataset() {
 
     # 5. Standalone task with description
     local standalone_id
-    standalone_id=$(bd_create "$ws" "$bin" --title "Standalone detailed task" --type task --priority 2 --description "This task has a detailed description for fidelity testing.") || true
+    standalone_id=$(bd_create "$ws" "$bin" \
+        --title "Standalone detailed task" \
+        --type task \
+        --priority 2 \
+        --description "This task has a detailed description for fidelity testing." \
+        --notes "Historical notes must survive the upgrade." \
+        --design "Historical design must survive the upgrade." \
+        --acceptance "Historical acceptance criteria must survive the upgrade." \
+        --external-ref "legacy-upgrade-42") || true
     if [ -n "${standalone_id:-}" ]; then
         DATASET_IDS[standalone]="$standalone_id"
         DATASET_FEATURES+=("standalone")
@@ -116,9 +129,13 @@ create_dataset() {
     local closed_id
     closed_id=$(bd_create "$ws" "$bin" --title "Already closed issue" --type task --priority 3) || true
     if [ -n "${closed_id:-}" ]; then
-        bd_in "$ws" "$bin" close "$closed_id" >/dev/null 2>&1 || true
-        DATASET_IDS[closed]="$closed_id"
-        DATASET_FEATURES+=("closed")
+        if bd_in "$ws" "$bin" close "$closed_id" >/dev/null 2>&1; then
+            DATASET_IDS[closed]="$closed_id"
+            DATASET_FEATURES+=("closed")
+        else
+            echo "  ERROR: could not close source fixture issue" >&2
+            errors=$((errors + 1))
+        fi
     fi
 
     # --- Optional features (version-gated, empirical) ---
@@ -132,7 +149,9 @@ create_dataset() {
 
     # Comments
     if [ -n "${task_id:-}" ]; then
-        if bd_in "$ws" "$bin" comment add "$task_id" "Test comment for fidelity checking" >/dev/null 2>&1; then
+        if bd_in "$ws" "$bin" comments add "$task_id" \
+            "Historical comment must survive the upgrade." \
+            --author "legacy-author" >/dev/null 2>&1; then
             DATASET_FEATURES+=("comment")
         fi
     fi

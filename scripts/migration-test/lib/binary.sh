@@ -17,6 +17,12 @@ esac
 download_binary() {
     local version="$1"
     local ver_bare="${version#v}"
+
+    if ${STRICT_MODE:-false}; then
+        download_verified_release_binary "$version"
+        return
+    fi
+
     local cached="$CACHE_DIR/bd-${ver_bare}"
 
     if [ -x "$cached" ]; then
@@ -60,6 +66,100 @@ download_binary() {
 
     # Fallback: build from source at the given tag
     build_from_source "$version" "$cached"
+}
+
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+        return
+    fi
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+        return
+    fi
+    echo "ERROR: no SHA-256 utility is available" >&2
+    return 1
+}
+
+verify_release_archive() {
+    local version="$1"
+    local archive="$2"
+    local expected actual
+    expected=$(strict_release_sha256 "$version" "$OS" "$ARCH") || {
+        echo "ERROR: no pinned release checksum for $version ($OS/$ARCH)" >&2
+        return 1
+    }
+    actual=$(sha256_file "$archive") || return 1
+    if [ "$actual" != "$expected" ]; then
+        echo "ERROR: checksum mismatch for $version: got $actual, want $expected" >&2
+        return 1
+    fi
+}
+
+verify_release_binary_version() {
+    local version="$1"
+    local binary="$2"
+    local bare="${version#v}"
+    local output
+    output=$("$binary" version 2>&1) || {
+        echo "ERROR: verified $version binary does not run" >&2
+        return 1
+    }
+    if [[ " $output " != *" $bare "* ]]; then
+        echo "ERROR: release binary reports unexpected version: $output" >&2
+        return 1
+    fi
+}
+
+download_verified_release_binary() {
+    local version="$1"
+    local asset expected release_dir archive binary
+    asset=$(strict_release_asset "$version" "$OS" "$ARCH") || {
+        echo "ERROR: no strict release manifest for $version ($OS/$ARCH)" >&2
+        return 1
+    }
+    expected=$(strict_release_sha256 "$version" "$OS" "$ARCH") || return 1
+    release_dir="$CACHE_DIR/verified/${version}-${OS}-${ARCH}-${expected}"
+    archive="$release_dir/$asset"
+    binary="$release_dir/bd"
+    mkdir -p "$release_dir"
+
+    if [ ! -f "$archive" ]; then
+        local url tmp
+        url="https://github.com/gastownhall/beads/releases/download/${version}/${asset}"
+        tmp="$archive.tmp.$$"
+        echo -e "  ${YELLOW:-}downloading verified ${version}...${NC:-}" >&2
+        if ! curl -fsSL --max-time "$DOWNLOAD_TIMEOUT" "$url" -o "$tmp"; then
+            rm -f "$tmp"
+            echo "ERROR: could not download pinned release asset for $version" >&2
+            return 1
+        fi
+        if ! verify_release_archive "$version" "$tmp"; then
+            rm -f "$tmp"
+            return 1
+        fi
+        mv -f "$tmp" "$archive"
+    fi
+    verify_release_archive "$version" "$archive" || return 1
+
+    local extract_dir extracted
+    extract_dir=$(mktemp -d)
+    if ! tar -xzf "$archive" -C "$extract_dir"; then
+        rm -rf "$extract_dir"
+        echo "ERROR: could not extract pinned release asset for $version" >&2
+        return 1
+    fi
+    extracted=$(find "$extract_dir" -name bd -type f | head -1)
+    if [ -z "$extracted" ]; then
+        rm -rf "$extract_dir"
+        echo "ERROR: pinned release asset for $version contains no bd binary" >&2
+        return 1
+    fi
+    cp -f "$extracted" "$binary"
+    chmod +x "$binary"
+    rm -rf "$extract_dir"
+    verify_release_binary_version "$version" "$binary" || return 1
+    printf '%s\n' "$binary"
 }
 
 # Build a specific version from source by checking out its tag in a temp dir.

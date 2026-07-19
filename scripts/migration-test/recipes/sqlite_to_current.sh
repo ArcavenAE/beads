@@ -19,6 +19,47 @@
 #     3. Run: bd init --from-jsonl --quiet
 #     4. Verify: bd list --all
 
+preserve_sqlite_source_artifacts() {
+    local ws="$1"
+    local relative source_file backup_file
+
+    # Validate the entire destination set before copying anything so a late
+    # collision cannot leave a partial backup behind.
+    for relative in "${CLASSIC_SQLITE_ROLLBACK_FILES[@]}"; do
+        source_file="$ws/.beads/$relative"
+        backup_file="${source_file}.pre-migration"
+
+        if [ ! -e "$source_file" ]; then
+            if [ -e "$backup_file" ]; then
+                echo "  FAILED: stale rollback artifact has no active source: $backup_file"
+                return 1
+            fi
+            continue
+        fi
+        if [ ! -f "$source_file" ]; then
+            echo "  FAILED: SQLite source artifact is not a regular file: $source_file"
+            return 1
+        fi
+        if [ -e "$backup_file" ]; then
+            if [ ! -f "$backup_file" ] || ! cmp -s "$source_file" "$backup_file"; then
+                echo "  FAILED: rollback artifact collides with different source data: $backup_file"
+                return 1
+            fi
+        fi
+    done
+
+    for relative in "${CLASSIC_SQLITE_ROLLBACK_FILES[@]}"; do
+        source_file="$ws/.beads/$relative"
+        backup_file="${source_file}.pre-migration"
+        if [ -f "$source_file" ] && [ ! -e "$backup_file" ]; then
+            cp -pf "$source_file" "$backup_file" || {
+                echo "  FAILED: could not preserve rollback source $source_file"
+                return 1
+            }
+        fi
+    done
+}
+
 recipe_sqlite_to_current() {
     local ws="$1"
     local old_bin="$2"
@@ -26,6 +67,12 @@ recipe_sqlite_to_current() {
     local version="$4"
 
     echo "  Trying SQLite→current recipe..."
+
+    # Preserve the rollback source before invoking any historical command.
+    # Some old binaries update SQLite bookkeeping even for export/read paths;
+    # backing up afterward would retain a migration-touched database instead
+    # of the exact source that the user started with.
+    preserve_sqlite_source_artifacts "$ws" || return 1
 
     # Strategy 1: Use old binary's export command
     if bd_in "$ws" "$old_bin" export --format jsonl > "$ws/.beads/issues.jsonl.tmp" 2>/dev/null; then
@@ -135,15 +182,19 @@ recipe_sqlite_to_current() {
     fi
 
     # Stop any old dolt server
-    stop_dolt_server "$ws"
+    if ! stop_dolt_server "$ws"; then
+        echo "  FAILED: could not prove the workspace server stopped"
+        return 1
+    fi
 
-    # Move old artifacts out of the way so the candidate's
+    # Remove active old artifacts now that the byte-identical rollback copies
+    # and JSONL export are durable. This lets the candidate's
     # checkExistingBeadsData guard does not reject init as "already initialized".
     # Includes embeddeddolt/ which may have been created empty by a failed
     # direct upgrade attempt in the harness.
-    for old_file in "$ws/.beads/beads.db" "$ws/.beads/beads.db-wal" "$ws/.beads/beads.db-shm" \
-                     "$ws/.beads/metadata.json" "$ws/.beads/config.json"; do
-        [ -f "$old_file" ] && mv "$old_file" "${old_file}.pre-migration" 2>/dev/null || true
+    local old_file
+    for old_file in "${CLASSIC_SQLITE_ROLLBACK_FILES[@]}"; do
+        [ -f "$ws/.beads/$old_file" ] && rm -f "$ws/.beads/$old_file"
     done
     for old_dir in "$ws/.beads/embeddeddolt" "$ws/.beads/dolt"; do
         [ -d "$old_dir" ] && mv "$old_dir" "${old_dir}.pre-migration" 2>/dev/null || true

@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/steveyegge/beads/cmd/bd/doctor"
@@ -12,6 +14,7 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/doltserver"
+	"github.com/steveyegge/beads/internal/safefile"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
@@ -19,6 +22,157 @@ import (
 // This prevents the upgrade notification from firing repeatedly when git operations
 // reset the tracked metadata.json file.
 const localVersionFile = ".local_version"
+
+// refuseLegacyDoltServerWorkspace recognizes the server storage contract used
+// by v0.50-v0.62. The v0.50-v0.58 metadata predates project identity and is
+// unambiguous. v0.59-v0.62 metadata otherwise overlaps supported modern server
+// providers, so that later cohort additionally requires an exact, safely read
+// historical version witness. This check is store-free and has no migration
+// side effects.
+func refuseLegacyDoltServerWorkspace(beadsDir string, cfg *configfile.Config) error {
+	return refuseLegacyDoltServerWorkspaceWithVersionWitnessOpener(beadsDir, cfg, safefile.OpenReadOnlyNoFollow)
+}
+
+func refuseLegacyDoltServerWorkspaceWithVersionWitnessOpener(
+	beadsDir string,
+	cfg *configfile.Config,
+	opener func(string) (*os.File, error),
+) error {
+	if cfg == nil || cfg.GetBackend() != configfile.BackendDolt ||
+		!strings.EqualFold(cfg.DoltMode, configfile.DoltModeServer) {
+		return nil
+	}
+	legacySource := ""
+	hasHistoricalProjectIdentity := false
+	if cfg.ProjectID != "" {
+		version, state := readLegacyDoltVersionWitnessWithOpener(beadsDir, opener)
+		if state == legacyDoltVersionWitnessAmbiguous {
+			return fmt.Errorf("cannot safely classify possible legacy Dolt-server workspace at %q because its %s witness changed or could not be read consistently; preserve a byte-for-byte backup of .beads, stop other bd processes touching the workspace, and retry (refusing to open or modify it)", beadsDir, localVersionFile)
+		}
+		if state != legacyDoltVersionWitnessStable || !isProjectIdentityLegacyDoltVersionWitness(version) {
+			return nil
+		}
+		legacySource = "bd " + version
+		hasHistoricalProjectIdentity = true
+	}
+	if err := dolt.ValidateDatabaseName(cfg.DoltDatabase); err != nil {
+		return fmt.Errorf("possible legacy Dolt-server workspace has an invalid database name %q: %v; preserve a byte-for-byte backup of .beads and use the matching historical bd binary for explicit migration (refusing to open or modify it)", cfg.DoltDatabase, err)
+	}
+	if hasHistoricalProjectIdentity {
+		return fmt.Errorf("legacy %s Dolt-server workspace requires explicit migration before bd %s can open it; first preserve a byte-for-byte backup of .beads and keep/use the matching historical bd binary for a qualified version-specific migration bridge; this build refuses automatic modification of %q",
+			legacySource, Version, beadsDir)
+	}
+	doltDir := cfg.PersistedDoltDataPath(beadsDir)
+	if doltDir == "" {
+		return nil
+	}
+	info, err := os.Lstat(doltDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("cannot safely classify possible legacy Dolt-server workspace at %q: %w (refusing to open or modify it)", doltDir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("possible legacy Dolt-server workspace has an ambiguous non-directory data root at %q; preserve it and run a version-specific explicit migration (refusing to open or modify it)", doltDir)
+	}
+
+	source := legacySource
+	if source == "" {
+		source = safeLegacyDoltVersionLabel(beadsDir)
+	}
+	return fmt.Errorf("legacy %s Dolt-server workspace requires explicit migration before bd %s can open it; first preserve a byte-for-byte backup of .beads and keep/use the matching historical bd binary for a qualified version-specific migration bridge; this build refuses automatic modification of %q",
+		source, Version, beadsDir)
+}
+
+const maxLegacyVersionWitnessBytes = 64
+
+type legacyDoltVersionWitnessState uint8
+
+const (
+	legacyDoltVersionWitnessMissing legacyDoltVersionWitnessState = iota
+	legacyDoltVersionWitnessStable
+	legacyDoltVersionWitnessAmbiguous
+)
+
+func safeLegacyDoltVersionLabel(beadsDir string) string {
+	version, state := readLegacyDoltVersionWitness(beadsDir)
+	if state != legacyDoltVersionWitnessStable || !isLegacyDoltVersionWitness(version) {
+		return "v0.50-v0.58-era"
+	}
+	return "bd " + version
+}
+
+func readLegacyDoltVersionWitness(beadsDir string) (string, legacyDoltVersionWitnessState) {
+	return readLegacyDoltVersionWitnessWithOpener(beadsDir, safefile.OpenReadOnlyNoFollow)
+}
+
+func readLegacyDoltVersionWitnessWithOpener(
+	beadsDir string,
+	opener func(string) (*os.File, error),
+) (string, legacyDoltVersionWitnessState) {
+	path := filepath.Join(beadsDir, localVersionFile)
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return "", legacyDoltVersionWitnessMissing
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxLegacyVersionWitnessBytes {
+		return "", legacyDoltVersionWitnessAmbiguous
+	}
+	file, err := opener(path)
+	if err != nil {
+		return "", legacyDoltVersionWitnessAmbiguous
+	}
+	defer func() { _ = file.Close() }()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) ||
+		openedInfo.Size() != info.Size() || !openedInfo.ModTime().Equal(info.ModTime()) {
+		return "", legacyDoltVersionWitnessAmbiguous
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxLegacyVersionWitnessBytes+1))
+	if err != nil || len(data) > maxLegacyVersionWitnessBytes {
+		return "", legacyDoltVersionWitnessAmbiguous
+	}
+	afterInfo, err := file.Stat()
+	if err != nil {
+		return "", legacyDoltVersionWitnessAmbiguous
+	}
+	namedAfter, err := os.Lstat(path)
+	if err != nil || !namedAfter.Mode().IsRegular() ||
+		!os.SameFile(openedInfo, afterInfo) || !os.SameFile(openedInfo, namedAfter) ||
+		openedInfo.Size() != afterInfo.Size() || int64(len(data)) != afterInfo.Size() ||
+		!openedInfo.ModTime().Equal(afterInfo.ModTime()) {
+		return "", legacyDoltVersionWitnessAmbiguous
+	}
+	version := strings.TrimSpace(string(data))
+	return version, legacyDoltVersionWitnessStable
+}
+
+func isLegacyDoltVersionWitness(version string) bool {
+	major, minor, ok := parseCanonicalBdVersion(version)
+	return ok && major == 0 && minor >= 50 && minor <= 62
+}
+
+func isProjectIdentityLegacyDoltVersionWitness(version string) bool {
+	major, minor, ok := parseCanonicalBdVersion(version)
+	return ok && major == 0 && minor >= 59 && minor <= 62
+}
+
+func parseCanonicalBdVersion(version string) (major, minor int, ok bool) {
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return 0, 0, false
+	}
+	major, majorErr := strconv.Atoi(parts[0])
+	minor, minorErr := strconv.Atoi(parts[1])
+	patch, patchErr := strconv.Atoi(parts[2])
+	if majorErr != nil || minorErr != nil || patchErr != nil ||
+		major < 0 || minor < 0 || patch < 0 ||
+		strconv.Itoa(major) != parts[0] || strconv.Itoa(minor) != parts[1] || strconv.Itoa(patch) != parts[2] {
+		return 0, 0, false
+	}
+	return major, minor, true
+}
 
 // trackBdVersion checks if bd version has changed since last run and updates the local version file.
 // This function is best-effort - failures are silent to avoid disrupting commands.

@@ -585,10 +585,18 @@ func getOwner() string {
 	return ""
 }
 
+func isMigrationV062InspectRawEntrypoint(args []string) bool {
+	return len(args) > 1 && args[1] == "__migration-v062-inspect"
+}
+
 func init() {
-	// Initialize viper configuration
-	if err := config.Initialize(); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to initialize config: %v\n", err)
+	// The private v0.62 inspector's supported grammar requires its command token
+	// to be argv[1]. Skip ambient config (and its git-backed discovery) before
+	// Cobra starts; the leaf and root lifecycle bypasses remain defense in depth.
+	if !isMigrationV062InspectRawEntrypoint(os.Args) {
+		if err := config.Initialize(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to initialize config: %v\n", err)
+		}
 	}
 
 	// Register persistent flags
@@ -694,6 +702,12 @@ var rootCmd = &cobra.Command{
 		_ = cmd.Help() // Help() always returns nil for cobra commands
 	},
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) (returnErr error) {
+		// Private migration admission must not discover ambient workspaces, load
+		// project configuration, initialize metrics, or select a store before its
+		// descriptor-relative inspector runs.
+		if cmd == migrationV062InspectCmd {
+			return nil
+		}
 		defer func() {
 			if cmd == initCmd {
 				clearInitBackendPreflightAfterError(cmd, &returnErr)
@@ -855,8 +869,9 @@ var rootCmd = &cobra.Command{
 		// to avoid spawning git subprocesses for simple commands
 		// like "bd version" that don't need database access.
 		noDbCommands := []string{
-			"__complete",       // Cobra's internal completion command (shell completions work without db)
-			"__completeNoDesc", // Cobra's completion without descriptions (used by fish)
+			"__migration-v062-inspect", // private, descriptor-relative source admission
+			"__complete",               // Cobra's internal completion command (shell completions work without db)
+			"__completeNoDesc",         // Cobra's completion without descriptions (used by fish)
 			"bash",
 			"bootstrap",
 			"completion",
@@ -1067,6 +1082,15 @@ var rootCmd = &cobra.Command{
 		}
 
 		beadsDir := resolveCommandBeadsDir(dbPath)
+		// Refuse incompatible metadata before version tracking, migration, or store open.
+		// Canonicalize first because supported .beads roots may themselves be symlinks.
+		readOnlyCfg, configErr := configfile.LoadReadOnly(utils.CanonicalizePath(beadsDir))
+		if configErr != nil {
+			return HandleError("workspace metadata is incompatible with this bd version: %v (refusing to open or modify %s)", configErr, beadsDir)
+		}
+		if err := refuseLegacyDoltServerWorkspace(beadsDir, readOnlyCfg); err != nil {
+			return HandleError("%v", err)
+		}
 		prepareSelectedCommandContext(beadsDir, true)
 		refreshBoundCommandConfig(cmd)
 		if _, err := getDoltAutoCommitMode(); err != nil {
@@ -1383,6 +1407,9 @@ var rootCmd = &cobra.Command{
 		return nil
 	},
 	PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
+		if cmd == migrationV062InspectCmd {
+			return nil
+		}
 		defer restoreChangeDirSelection()
 
 		if proxiedServerMode {

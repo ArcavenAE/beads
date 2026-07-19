@@ -48,7 +48,10 @@ recipe_fix_dash_prefix() {
     echo "  sanitizing prefix: '$prefix' → '$sanitized'"
 
     # Stop server, export data, re-init with sanitized prefix
-    stop_dolt_server "$ws"
+    if ! stop_dolt_server "$ws"; then
+        echo "  FAILED: could not prove the workspace server stopped"
+        return 1
+    fi
 
     # Export data with old binary first
     local list_json
