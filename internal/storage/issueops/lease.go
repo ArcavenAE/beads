@@ -3,7 +3,6 @@ package issueops
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"strings"
@@ -52,9 +51,9 @@ func explicitLeaseTTL(ctx context.Context) (time.Duration, bool) {
 // every claim stamps a DefaultLeaseTTL lease and a supervisor `bd reclaim`
 // recovers dead workers. "off" disarms automatic stamping for deployments
 // whose recovery authority lives elsewhere (an orchestrator with its own
-// liveness evidence): claims carry NULL lease columns — invisible to
-// reclaim — and only explicitly requested leases (WithLeaseTTL /
-// --lease-ttl) are ever reclaimable. See `bd lease disarm`.
+// liveness evidence): claims carry no lease row — invisible to reclaim —
+// and only explicitly requested leases (WithLeaseTTL / --lease-ttl) are
+// ever reclaimable. See `bd lease disarm`.
 const LeaseAutoConfigKey = "lease.auto"
 
 // autoLeaseEnabled reads the lease.auto store config inside the claim's
@@ -76,50 +75,32 @@ func autoLeaseEnabled(ctx context.Context, tx DBTX) (bool, error) {
 	return true, nil
 }
 
-// ClaimLeaseClause renders the lease columns for a claim: a fresh lease when
-// one was explicitly requested or automatic stamping is on, NULLs otherwise —
-// an unleased claim also scrubs any stale lease left by a legacy release
-// path, so a later reclaim can never key on leftovers. Both shapes rewrite
-// row_lock (the fence-pairing and anti-cell-merge invariant).
-func ClaimLeaseClause(ctx context.Context, tx DBTX, now time.Time) (string, []interface{}, error) {
-	if ttl, explicit := explicitLeaseTTL(ctx); explicit {
-		clause, args := leaseSetClause(now, ttl)
-		return clause, args, nil
-	}
-	auto, err := autoLeaseEnabled(ctx, tx)
-	if err != nil {
-		return "", nil, err
-	}
-	if auto {
-		clause, args := leaseSetClause(now, DefaultLeaseTTL)
-		return clause, args, nil
-	}
-	return "lease_expires_at = NULL, heartbeat_at = NULL, row_lock = ?", []interface{}{freshRowLock()}, nil
-}
-
 // freshRowLock returns a random non-zero int64 for the row_lock cell.
 //
 // row_lock is the keystone of dead-worker recovery on Dolt. Dolt has no real
 // row locking and merges concurrent commits cell-by-cell, so two transactions
-// that touch DIFFERENT cells of the same issue row (a heartbeat writing
-// heartbeat_at, a close writing status) merge silently instead of conflicting —
-// which would let a reclaim quietly revert an issue the owner just closed. By
-// having every status/ownership/lease-mutating path rewrite this one shared cell
-// to a fresh random value, those writers always collide on row_lock, surfacing
-// the 1213/1205 serialization conflict that withRetryTx replays. The value's
-// only job is to differ from whatever a concurrent writer wrote, so any source
-// of entropy works; we use crypto/rand to avoid seeding concerns. Never 0 (the
+// that touch DIFFERENT cells of the same issue row (a reclaim writing status,
+// a close writing closed_at) merge silently instead of conflicting — which
+// would let a reclaim quietly revert an issue the owner just closed. By having
+// every status/ownership-mutating path rewrite this one shared cell to a fresh
+// random value, those writers always collide on row_lock, surfacing the
+// 1213/1205 serialization conflict that withRetryTx replays. The value's only
+// job is to differ from whatever a concurrent writer wrote, so any source of
+// entropy works; we use crypto/rand to avoid seeding concerns. Never 0 (the
 // column default) so a freshly-claimed row is always distinguishable from a
 // never-touched one.
 //
-// INVARIANT: any path that mutates status, assignee, started_at, or the lease
-// columns on an in_progress issue MUST rewrite row_lock — that is the set the
-// reclaim/heartbeat races care about (claim, close, updateIssueInTx, heartbeat,
-// reclaim all do). Paths that touch only orthogonal cells (is_blocked,
-// compaction_level, dependency metadata, rename, or reopen — which acts on
-// closed rows) are safe to merge with a reclaim and intentionally do NOT rewrite
-// it. Adding a new path that sets status/assignee/lease outside updateIssueInTx
-// without rewriting row_lock would silently reintroduce the zombie-merge bug.
+// INVARIANT: any path that mutates status, assignee, or started_at on an
+// in_progress issue MUST rewrite row_lock — that is the set the reclaim/close
+// races care about (claim, close, updateIssueInTx, reclaim, unclaim all do).
+// Paths that touch only orthogonal cells (is_blocked, compaction_level,
+// dependency metadata, rename, or reopen — which acts on closed rows) are safe
+// to merge with a reclaim and intentionally do NOT rewrite it. Heartbeats and
+// lease renewals no longer touch the issues/wisps row at all (bd-lrgn1): the
+// lease lives in the ephemeral leases table, where a racing heartbeat and
+// reclaim contend on the SAME lease row and conflict without any help. Adding
+// a new path that sets status/assignee outside updateIssueInTx without
+// rewriting row_lock would silently reintroduce the zombie-merge bug.
 func freshRowLock() int64 {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -134,26 +115,80 @@ func freshRowLock() int64 {
 	return v
 }
 
-// leaseSetClause returns the SET-clause fragment and args that stamp a fresh
-// lease onto a row being claimed or heartbeated: a future expiry, a now
-// heartbeat, and a fresh row_lock. Append to an existing UPDATE's SET list.
-func leaseSetClause(now time.Time, ttl time.Duration) (string, []interface{}) {
-	return "lease_expires_at = ?, heartbeat_at = ?, row_lock = ?",
-		[]interface{}{now.Add(ttl), now, freshRowLock()}
+// RowLockClause returns the SET-clause fragment and arg that rewrite row_lock
+// to a fresh value. Append to any UPDATE that mutates status/assignee/
+// started_at on an issues row (see the freshRowLock invariant). Exported for
+// the proxied-server (uow) claim path in internal/storage/domain/db, which
+// builds its own claim UPDATE rather than calling ClaimIssueInTx.
+func RowLockClause() (string, []interface{}) {
+	return "row_lock = ?", []interface{}{freshRowLock()}
 }
 
-// LeaseSetClause is the exported form of leaseSetClause, for the proxied-server
-// (uow) claim path in internal/storage/domain/db, which builds its own claim
-// UPDATE rather than calling ClaimIssueInTx. Keeping both paths on this one
-// helper is what stops the proxied path from reintroducing the missing-lease /
-// cell-merge bug the row_lock invariant guards against.
-func LeaseSetClause(now time.Time, ttl time.Duration) (string, []interface{}) {
-	return leaseSetClause(now, ttl)
+// LeaseTTL is the exported form of leaseTTL: it resolves the lease TTL for the
+// current claim from the context (WithLeaseTTL) or falls back to
+// DefaultLeaseTTL.
+func LeaseTTL(ctx context.Context) time.Duration {
+	return leaseTTL(ctx)
+}
+
+// UpsertLeaseInTx grants or re-grants the lease on an issue to holder: a
+// future expiry, a now heartbeat. The lease row lives in the ephemeral leases
+// table (dolt_ignored on the Dolt backend, bd-lrgn1), NOT on the issues row,
+// so granting or renewing it mints no Dolt commit and no history. Leases are
+// deliberately node-local: they are only enforceable on the replica that
+// granted them; cross-machine claim VISIBILITY rides status/assignee on the
+// issues row, which still commits.
+//
+// INVARIANT: a leases row exists if and only if its issue is a live claim
+// (in_progress with the row's holder as assignee) on this node. Every path
+// that ends or transfers a claim — close, unclaim, reclaim, delete, a generic
+// update that changes status/assignee, an import that accepts a newer
+// non-claimed snapshot — must delete the lease row (DeleteLeaseInTx). Leases
+// are tier-complete: wisp-table rows (durable no_history work) lease through
+// this same table, keyed on their id.
+func UpsertLeaseInTx(ctx context.Context, tx DBTX, id, holder string, now time.Time, ttl time.Duration) error {
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO leases (issue_id, holder, granted_at, lease_expires_at, heartbeat_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+			holder = VALUES(holder),
+			granted_at = VALUES(granted_at),
+			lease_expires_at = VALUES(lease_expires_at),
+			heartbeat_at = VALUES(heartbeat_at)
+	`, id, holder, now, now.Add(ttl), now)
+	if err != nil {
+		return fmt.Errorf("upsert lease for %s: %w", id, err)
+	}
+	return nil
+}
+
+// ClaimLeaseUpsert grants the lease for a claim that just won its CAS,
+// honoring the lease.auto config (see LeaseAutoConfigKey): an explicitly
+// requested lease (WithLeaseTTL / --lease-ttl) is always granted with its
+// TTL; otherwise automatic stamping grants DefaultLeaseTTL when armed. On a
+// disarmed store an unrequested claim gets NO lease — but any stale lease
+// row left by a legacy release path is scrubbed, so a later reclaim can
+// never key on leftovers. Both claim dispatch layers (issueops.
+// ClaimIssueInTx and the proxied-server path in internal/storage/domain/db)
+// call this one helper so the grant policy cannot drift between them.
+func ClaimLeaseUpsert(ctx context.Context, tx DBTX, id, holder string, now time.Time) error {
+	if ttl, explicit := explicitLeaseTTL(ctx); explicit {
+		return UpsertLeaseInTx(ctx, tx, id, holder, now, ttl)
+	}
+	auto, err := autoLeaseEnabled(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if auto {
+		return UpsertLeaseInTx(ctx, tx, id, holder, now, DefaultLeaseTTL)
+	}
+	return DeleteLeaseInTx(ctx, tx, id)
 }
 
 // DeleteLeaseInTx removes the lease row for an issue, if any. Call from every
-// path that ends or transfers a claim. Deleting a lease that does not exist is
-// a no-op, so callers may invoke it unconditionally.
+// path that ends or transfers a claim (see the UpsertLeaseInTx invariant).
+// Deleting a lease that does not exist is a no-op, so callers may invoke it
+// unconditionally.
 func DeleteLeaseInTx(ctx context.Context, tx DBTX, id string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM leases WHERE issue_id = ?`, id); err != nil {
 		return fmt.Errorf("delete lease for %s: %w", id, err)
@@ -183,6 +218,9 @@ func RestoreLeaseOnImportInTx(ctx context.Context, tx DBTX, issue *types.Issue, 
 				grantedAt = *issue.HeartbeatAt
 				heartbeatAt = *issue.HeartbeatAt
 			}
+			// Assignment order matters: lease_expires_at is the liveness
+			// comparison column and ON DUPLICATE KEY UPDATE assignments are
+			// evaluated in order, so it must be reassigned LAST.
 			_, err := tx.ExecContext(ctx, `
 				INSERT INTO leases (issue_id, holder, granted_at, lease_expires_at, heartbeat_at)
 				VALUES (?, ?, ?, ?, ?)
@@ -214,42 +252,34 @@ func RestoreLeaseOnImportInTx(ctx context.Context, tx DBTX, issue *types.Issue, 
 	return nil
 }
 
-// LeaseTTL is the exported form of leaseTTL: it resolves the lease TTL for the
-// current claim from the context (WithLeaseTTL) or falls back to
-// DefaultLeaseTTL.
-func LeaseTTL(ctx context.Context) time.Duration {
-	return leaseTTL(ctx)
-}
-
 // HeartbeatIssueInTx proves the lease owner is still alive: it pushes
-// lease_expires_at forward by the TTL, stamps heartbeat_at = now, and rewrites
-// row_lock so the heartbeat conflicts with any concurrent reclaim/close on the
-// same row (see freshRowLock). Only the current owner of an in_progress issue
-// may heartbeat — a heartbeat from anyone else, or on an issue that is no longer
-// in_progress (already closed or already reclaimed), affects no rows and returns
-// storage.ErrNotClaimable so the caller learns its lease is gone.
+// lease_expires_at forward by the TTL and stamps heartbeat_at = now on the
+// issue's lease row. Only the current holder may heartbeat — a heartbeat from
+// anyone else, or on an issue whose lease is gone (closed, unclaimed,
+// reclaimed), affects no rows and returns storage.ErrNotClaimable /
+// ErrAlreadyClaimed so the caller learns its lease is gone.
 //
-// Routes to the correct table (issues/wisps). The caller owns Dolt versioning.
+// The write touches ONLY the leases table (ephemeral, dolt_ignored): a
+// heartbeat mints no Dolt commit and no history, and deliberately does NOT
+// stamp issues.updated_at. Leases are tier-complete: wisp-table claims renew
+// through the same lease row, and the disambiguation read routes to the
+// correct tier.
+//
+// Heartbeat is a RENEWAL, not an arming path, on a disarmed store (lease.auto
+// off): an owned in_progress row without a lease row is rejected with
+// storage.ErrUnleased there — arming a lease as a heartbeat side effect would
+// silently re-create the unrequested reclaim exposure disarming exists to
+// remove. Under the shipped default (lease.auto on) an owned unleased row is
+// a legacy claim from before the lease stack, and the heartbeat arms it,
+// converging it into the lease regime (preserved upstream behavior).
 //
 //nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
 func HeartbeatIssueInTx(ctx context.Context, tx DBTX, id, actor string) error {
-	isWisp := IsActiveWispInTx(ctx, tx, id)
-	issueTable, _, _, _ := WispTableRouting(isWisp)
-
 	now := time.Now().UTC()
-	leaseClause, leaseArgs := leaseSetClause(now, leaseTTL(ctx))
-
-	args := append([]interface{}{}, leaseArgs...)
-	args = append(args, id, actor)
-	// The lease_expires_at IS NOT NULL predicate keeps heartbeat a RENEWAL:
-	// it must never ARM a lease on a deliberately unleased claim (lease.auto
-	// off) — that would silently re-create the unrequested reclaim exposure
-	// disarming exists to remove.
-	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		UPDATE %s SET %s
-		WHERE id = ? AND status = 'in_progress' AND assignee = ?
-		  AND lease_expires_at IS NOT NULL
-	`, issueTable, leaseClause), args...)
+	result, err := tx.ExecContext(ctx, `
+		UPDATE leases SET lease_expires_at = ?, heartbeat_at = ?
+		WHERE issue_id = ? AND holder = ?
+	`, now.Add(leaseTTL(ctx)), now, id, actor)
 	if err != nil {
 		return fmt.Errorf("failed to heartbeat issue: %w", err)
 	}
@@ -258,26 +288,35 @@ func HeartbeatIssueInTx(ctx context.Context, tx DBTX, id, actor string) error {
 		return fmt.Errorf("failed to get rows affected: %w", err)
 	}
 	if rows == 0 {
-		// Disambiguate for the caller: gone (closed/reopened/reclaimed),
-		// not-found, owned by someone else, or owned-but-unleased.
+		// No lease row changed. Disambiguate from the issue row: gone
+		// (closed/reopened/reclaimed), not-found, owned by someone else, or
+		// owned-but-unleased.
+		isWisp := IsActiveWispInTx(ctx, tx, id)
+		issueTable, _, _, _ := WispTableRouting(isWisp)
 		var assignee, status string
-		var leaseExpires sql.NullTime
 		qerr := tx.QueryRowContext(ctx,
-			fmt.Sprintf("SELECT COALESCE(assignee, ''), status, lease_expires_at FROM %s WHERE id = ?", issueTable), id,
-		).Scan(&assignee, &status, &leaseExpires)
+			fmt.Sprintf("SELECT COALESCE(assignee, ''), status FROM %s WHERE id = ?", issueTable), id,
+		).Scan(&assignee, &status)
 		if qerr != nil {
 			return fmt.Errorf("%w: %s", storage.ErrNotClaimable, id)
 		}
 		if assignee != "" && assignee != actor {
 			return fmt.Errorf("%w by %s", storage.ErrAlreadyClaimed, assignee)
 		}
-		if assignee == actor && status == string(types.StatusInProgress) && !leaseExpires.Valid {
-			// Owned, in progress, no lease. Under the shipped default
-			// (lease.auto on) this is a legacy row from before the lease
-			// stack — the shipped heartbeat ARMED it, converging it into the
-			// lease regime, and that behavior is preserved. Only a disarmed
-			// store rejects: heartbeat there is strictly a renewal and must
-			// never arm a lease as a side effect.
+		if assignee == actor && status == string(types.StatusInProgress) {
+			// The caller genuinely holds the claim. Either its lease row exists
+			// but the UPDATE reported 0 changed rows (a same-second renewal
+			// writing identical values), or there is no lease row at all.
+			var leased int
+			if err := tx.QueryRowContext(ctx,
+				"SELECT COUNT(*) FROM leases WHERE issue_id = ? AND holder = ?", id, actor,
+			).Scan(&leased); err != nil {
+				return fmt.Errorf("read lease row for %s: %w", id, err)
+			}
+			if leased > 0 {
+				// Live lease: renew through the upsert (idempotent).
+				return UpsertLeaseInTx(ctx, tx, id, actor, now, leaseTTL(ctx))
+			}
 			auto, aerr := autoLeaseEnabled(ctx, tx)
 			if aerr != nil {
 				return aerr
@@ -285,19 +324,8 @@ func HeartbeatIssueInTx(ctx context.Context, tx DBTX, id, actor string) error {
 			if !auto {
 				return fmt.Errorf("%w: %s", storage.ErrUnleased, id)
 			}
-			armArgs := append([]interface{}{}, leaseArgs...)
-			armArgs = append(armArgs, id, actor)
-			res, err := tx.ExecContext(ctx, fmt.Sprintf(`
-				UPDATE %s SET %s
-				WHERE id = ? AND status = 'in_progress' AND assignee = ?
-			`, issueTable, leaseClause), armArgs...)
-			if err != nil {
-				return fmt.Errorf("failed to arm legacy lease: %w", err)
-			}
-			if n, err := res.RowsAffected(); err == nil && n > 0 {
-				return nil
-			}
-			return fmt.Errorf("%w: %s status %s", storage.ErrNotClaimable, id, status)
+			// Legacy unleased claim under lease.auto on: arm it.
+			return UpsertLeaseInTx(ctx, tx, id, actor, now, leaseTTL(ctx))
 		}
 		return fmt.Errorf("%w: %s status %s", storage.ErrNotClaimable, id, status)
 	}
@@ -310,7 +338,7 @@ func HeartbeatIssueInTx(ctx context.Context, tx DBTX, id, actor string) error {
 // ClearArmedLeasesInTx again in follow-up transactions until it clears zero
 // rows — a claim transaction that read lease.auto before the flip committed
 // can stamp a lease that the first sweep's snapshot never saw (disjoint rows,
-// so row_lock forces no conflict), and the bounded re-sweep is what closes
+// so nothing forces a conflict), and the bounded re-sweep is what closes
 // that window.
 func DisarmLeaseConfigInTx(ctx context.Context, tx DBTX) error {
 	if err := SetConfigInTx(ctx, tx, LeaseAutoConfigKey, "off"); err != nil {
@@ -319,21 +347,20 @@ func DisarmLeaseConfigInTx(ctx context.Context, tx DBTX) error {
 	return nil
 }
 
-// ClearArmedLeasesInTx NULLs the lease columns on every in_progress leased
-// row in the given table without releasing anything: status/assignee are
-// untouched and the fence does not move — disarming is lease bookkeeping,
-// not an ownership transition. It cannot distinguish explicitly requested
-// leases from auto-stamped ones; every armed lease in the table is cleared.
-// row_lock is rewritten so a racing heartbeat/reclaim conflicts rather than
-// cell-merging.
+// ClearArmedLeasesInTx deletes the lease row of every in_progress claim in
+// the given table without releasing anything: status/assignee are untouched
+// and the fence does not move — disarming is lease bookkeeping, not an
+// ownership transition. It cannot distinguish explicitly requested leases
+// from auto-stamped ones; every armed lease in the table is cleared. A racing
+// heartbeat/reclaim contends on the same lease row being deleted and
+// conflicts rather than cell-merging.
 //
 //nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
 func ClearArmedLeasesInTx(ctx context.Context, tx DBTX, issueTable string) (int64, error) {
 	res, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		UPDATE %s
-		SET lease_expires_at = NULL, heartbeat_at = NULL, row_lock = ?, updated_at = ?
-		WHERE status = 'in_progress' AND lease_expires_at IS NOT NULL
-	`, issueTable), freshRowLock(), time.Now().UTC())
+		DELETE FROM leases
+		WHERE issue_id IN (SELECT id FROM %s WHERE status = 'in_progress')
+	`, issueTable))
 	if err != nil {
 		return 0, fmt.Errorf("disarm leases in %s: %w", issueTable, err)
 	}
@@ -345,20 +372,25 @@ func ClearArmedLeasesInTx(ctx context.Context, tx DBTX, issueTable string) (int6
 }
 
 // ReclaimExpiredLeasesInTx reverts in_progress issues whose lease has gone stale
-// back to ready: status → open, assignee cleared, started_at cleared, and a
-// fresh row_lock so the reclaim conflicts with a racing heartbeat/close on the
-// same row (see freshRowLock). An issue is stale when its lease_expires_at is
-// non-null and strictly before cutoff. Callers pass cutoff = now - graceWindow
-// (the supervisor uses graceWindow = 2×TTL) so only leases that expired a safe
+// back to ready: the lease row is deleted, then status → open, assignee cleared,
+// started_at cleared, claim_fence bumped, and a fresh row_lock so the reclaim
+// conflicts with a racing close/update on the same issues row (see
+// freshRowLock). An issue is stale when its lease row's lease_expires_at is
+// strictly before cutoff. Callers pass cutoff = now - graceWindow (the
+// supervisor uses graceWindow = 2×TTL) so only leases that expired a safe
 // margin ago — i.e. workers that are almost certainly dead — are reclaimed.
+//
+// Leases are node-local (the leases table is dolt_ignored and does not
+// replicate), so a reclaim can only recover claims granted through this node —
+// which is the only place the lease was ever enforceable anyway.
 //
 // Reclaim is tier-complete: it sweeps both the permanent issues table and the
 // wisps table (which holds durable no_history work), recording recovery
-// events in the tier's own event table. Only rows carrying a lease are ever
-// touched — with requested-lease semantics (lease.auto off), unleased claims
-// are invisible to the reaper regardless of tier. Each result reports the
-// tier and the row's post-bump claim_fence so the previous holder is fenced
-// out and callers can project recovery correctly. The caller owns Dolt
+// events in the tier's own event table. Only rows carrying a lease row are
+// ever touched — with requested-lease semantics (lease.auto off), unleased
+// claims are invisible to the reaper regardless of tier. Each result reports
+// the tier and the row's post-bump claim_fence so the previous holder is
+// fenced out and callers can project recovery correctly. The caller owns Dolt
 // versioning.
 func ReclaimExpiredLeasesInTx(ctx context.Context, tx DBTX, cutoff time.Time, actor string) ([]types.ReclaimedLease, error) {
 	var reclaimed []types.ReclaimedLease
@@ -378,15 +410,15 @@ func ReclaimExpiredLeasesInTx(ctx context.Context, tx DBTX, cutoff time.Time, ac
 //nolint:gosec // G201: table names are the hardcoded tier constants above
 func reclaimExpiredInTable(ctx context.Context, tx DBTX, issueTable, eventTable string, cutoff time.Time, actor string) ([]types.ReclaimedLease, error) {
 	// Snapshot the stale set first so we can report exactly which issues we
-	// reverted and record per-issue recovery events. The UPDATE below repeats
-	// the predicate, so an issue that a concurrent heartbeat rescued between the
-	// SELECT and the UPDATE is simply skipped (0 rows) — it never appears as
-	// reclaimed.
+	// reverted and record per-issue recovery events. The DELETE below repeats
+	// the expiry predicate, so an issue that a concurrent heartbeat rescued
+	// between the SELECT and the DELETE is simply skipped (0 rows) — it never
+	// appears as reclaimed.
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
-		SELECT id, COALESCE(assignee, '') FROM %s
-		WHERE status = 'in_progress'
-		  AND lease_expires_at IS NOT NULL
-		  AND lease_expires_at < ?
+		SELECT l.issue_id, COALESCE(t.assignee, '') FROM leases l
+		JOIN %s t ON t.id = l.issue_id
+		WHERE t.status = 'in_progress'
+		  AND l.lease_expires_at < ?
 	`, issueTable), cutoff)
 	if err != nil {
 		return nil, fmt.Errorf("scan for stale leases in %s: %w", issueTable, err)
@@ -415,19 +447,14 @@ func reclaimExpiredInTable(ctx context.Context, tx DBTX, issueTable, eventTable 
 	var reclaimed []types.ReclaimedLease
 	for i := range stale {
 		r := &stale[i]
-		// Re-check the predicate inside the UPDATE so a heartbeat that landed
-		// after the snapshot (pushing lease_expires_at back into the future, or
-		// the row already closed) cannot be clobbered. row_lock makes the racing
-		// writer conflict; this WHERE makes a winning racer's rescue stick.
-		res, err := tx.ExecContext(ctx, fmt.Sprintf(`
-			UPDATE %s
-			SET status = 'open', assignee = NULL, started_at = NULL,
-			    lease_expires_at = NULL, heartbeat_at = NULL,
-			    claim_fence = claim_fence + 1,
-			    updated_at = ?, row_lock = ?
-			WHERE id = ? AND status = 'in_progress'
-			  AND lease_expires_at IS NOT NULL AND lease_expires_at < ?
-		`, issueTable), time.Now().UTC(), freshRowLock(), r.ID, cutoff)
+		// Re-check the expiry inside the DELETE so a heartbeat that landed
+		// after the snapshot (pushing lease_expires_at back into the future)
+		// cannot be clobbered: heartbeat and reclaim contend on this same lease
+		// row, so one of a racing pair is forced to retry, and a winning
+		// rescuer's pushed-out expiry makes this DELETE match nothing.
+		res, err := tx.ExecContext(ctx, `
+			DELETE FROM leases WHERE issue_id = ? AND lease_expires_at < ?
+		`, r.ID, cutoff)
 		if err != nil {
 			return nil, fmt.Errorf("reclaim %s: %w", r.ID, err)
 		}
@@ -436,7 +463,30 @@ func reclaimExpiredInTable(ctx context.Context, tx DBTX, issueTable, eventTable 
 			return nil, fmt.Errorf("reclaim %s rows affected: %w", r.ID, err)
 		}
 		if n == 0 {
-			continue // rescued by a concurrent heartbeat/close — leave it be
+			continue // rescued by a concurrent heartbeat — leave it be
+		}
+		// Revert the issue itself. status is re-checked so a row that stopped
+		// being in_progress under us (closed) is left alone; row_lock makes a
+		// concurrent close/update conflict at commit time rather than
+		// cell-merge with this write. The reclaim is an ownership transition,
+		// so it bumps claim_fence (fence⇒row_lock pairing satisfied in the
+		// same statement).
+		res, err = tx.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE %s
+			SET status = 'open', assignee = NULL, started_at = NULL,
+			    claim_fence = claim_fence + 1,
+			    updated_at = ?, row_lock = ?
+			WHERE id = ? AND status = 'in_progress'
+		`, issueTable), time.Now().UTC(), freshRowLock(), r.ID)
+		if err != nil {
+			return nil, fmt.Errorf("reclaim %s: %w", r.ID, err)
+		}
+		n, err = res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("reclaim %s rows affected: %w", r.ID, err)
+		}
+		if n == 0 {
+			continue // no longer in_progress — its lease row was stale anyway
 		}
 		// Report the post-bump fence so the caller holds the value that fences
 		// out the previous holder.

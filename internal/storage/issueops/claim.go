@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
@@ -18,10 +20,11 @@ type ClaimResult struct {
 	IsWisp   bool
 }
 
-// claimConflictError carries the frozen open-but-assigned conflict message
-// unchanged while unwrapping to storage.ErrAlreadyClaimed, so typed consumers
-// (exit codes, {code:"already_claimed"} JSON) classify the loss without the
-// sentinel's own text prefixing the message.
+// claimConflictError carries the open-but-assigned conflict message unchanged
+// while unwrapping to storage.ErrAlreadyClaimed, so typed consumers (exit
+// codes, {code:"already_claimed"} JSON) classify the loss without the
+// sentinel's own text prefixing the message. Downstream substring matchers
+// and this repo's own tests pin the "already assigned to" phrasing.
 type claimConflictError struct{ msg string }
 
 func (e *claimConflictError) Error() string { return e.msg }
@@ -29,7 +32,9 @@ func (e *claimConflictError) Unwrap() error { return storage.ErrAlreadyClaimed }
 
 // ClaimIssueInTx atomically claims an issue using compare-and-swap semantics.
 // It sets the assignee to actor and status to "in_progress" only if the issue
-// is currently open and unassigned or already assigned to the same actor.
+// is currently open and unassigned, already assigned to the same actor, or
+// assigned to a pool alias listed in the claim.pools config (see
+// ClaimPoolAliasesInTx).
 // Returns storage.ErrAlreadyClaimed if already claimed by a different user.
 // Idempotent: re-claiming an in_progress issue by the same actor is a no-op
 // success (supports agent retry workflows).
@@ -49,16 +54,40 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 
 	now := time.Now().UTC()
 
-	// Stamp a lease on the claim: lease_expires_at = now + TTL, heartbeat_at =
-	// now, and a fresh row_lock (see lease.go). The lease is what makes a claim
-	// recoverable — a worker that dies stops heartbeating and bd reclaim later
-	// reverts the issue. row_lock here also forces a concurrent reclaim/heartbeat
-	// to conflict rather than silently cell-merge. The claim is an ownership
-	// transition, so it also bumps claim_fence (fenceBumpExpr; row_lock pairing
-	// satisfied by the lease clause in the same statement).
-	leaseClause, leaseArgs, err := ClaimLeaseClause(ctx, tx, now)
+	// Rewrite row_lock with the claim (see lease.go): a concurrent reclaim or
+	// close on the same row is forced to conflict rather than silently
+	// cell-merge. The lease itself is granted separately below, in the
+	// ephemeral leases table — claims commit (status/assignee are
+	// history-worthy) but lease grants and heartbeats do not (bd-lrgn1). The
+	// claim is an ownership transition, so it also bumps claim_fence
+	// (fenceBumpExpr; the bump⇒row_lock pairing is satisfied by the row_lock
+	// rewrite in the same statement).
+	rowLockClause, rowLockArgs := RowLockClause()
+
+	// An issue is claimable from "open" plus any configured custom status whose
+	// category is "active" (e.g. a draft->ready->in_progress lifecycle where
+	// "ready" should be claimable). WIP/done/frozen customs are excluded so the
+	// anti-steal protection from GH-3570 is preserved.
+	claimableStatuses, err := ClaimableSourceStatusesInTx(ctx, tx)
 	if err != nil {
-		return nil, fmt.Errorf("resolve claim lease: %w", err)
+		return nil, fmt.Errorf("failed to resolve claimable statuses: %w", err)
+	}
+	statusPlaceholders, statusArgs := buildSQLInClause(claimableStatuses)
+
+	// Pool-aware claim (bd-bguz6): a dispatcher may pre-assign issues to a
+	// pool pseudo-assignee (e.g. "fable-crew"). Aliases listed in the
+	// claim.pools config are claimable by any actor through the same CAS;
+	// issues assigned to a real actor keep their anti-steal protection.
+	pools, err := ClaimPoolAliasesInTx(ctx, tx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve claim pools: %w", err)
+	}
+	assigneePredicate := "assignee = '' OR assignee IS NULL OR assignee = ?"
+	assigneeArgs := []interface{}{actor}
+	if len(pools) > 0 {
+		poolPlaceholders, poolArgs := buildSQLInClause(pools)
+		assigneePredicate += " OR assignee IN (" + poolPlaceholders + ")"
+		assigneeArgs = append(assigneeArgs, poolArgs...)
 	}
 
 	// Conditional UPDATE: only succeeds while the issue is still claimable.
@@ -68,21 +97,25 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 		result sql.Result
 	)
 	if oldIssue.StartedAt == nil {
-		args := append([]interface{}{actor, now, now}, leaseArgs...)
-		args = append(args, id, actor)
+		args := append([]interface{}{actor, now, now}, rowLockArgs...)
+		args = append(args, id)
+		args = append(args, statusArgs...)
+		args = append(args, assigneeArgs...)
 		result, err = tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE %s
 			SET assignee = ?, status = 'in_progress', updated_at = ?, started_at = ?, %s, %s
-			WHERE id = ? AND status = 'open' AND (assignee = '' OR assignee IS NULL OR assignee = ?)
-		`, issueTable, fenceBumpExpr, leaseClause), args...)
+			WHERE id = ? AND status IN (%s) AND (%s)
+		`, issueTable, fenceBumpExpr, rowLockClause, statusPlaceholders, assigneePredicate), args...)
 	} else {
-		args := append([]interface{}{actor, now}, leaseArgs...)
-		args = append(args, id, actor)
+		args := append([]interface{}{actor, now}, rowLockArgs...)
+		args = append(args, id)
+		args = append(args, statusArgs...)
+		args = append(args, assigneeArgs...)
 		result, err = tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE %s
 			SET assignee = ?, status = 'in_progress', updated_at = ?, %s, %s
-			WHERE id = ? AND status = 'open' AND (assignee = '' OR assignee IS NULL OR assignee = ?)
-		`, issueTable, fenceBumpExpr, leaseClause), args...)
+			WHERE id = ? AND status IN (%s) AND (%s)
+		`, issueTable, fenceBumpExpr, rowLockClause, statusPlaceholders, assigneePredicate), args...)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to claim issue: %w", err)
@@ -113,17 +146,36 @@ func ClaimIssueInTx(ctx context.Context, tx DBTX, id string, actor string) (*Cla
 			return &ClaimResult{OldIssue: oldIssue, IsWisp: isWisp}, nil
 		}
 		if assignee != "" && assignee != actor {
+			// A pool-assigned issue reaches here only when the CAS lost for a
+			// non-assignee reason (status changed underneath us): report the
+			// status rather than a misleading held-by-someone refusal.
+			if slices.Contains(pools, assignee) {
+				return nil, fmt.Errorf("%w: status %s", storage.ErrNotClaimable, currentStatus)
+			}
 			if currentStatus == types.StatusOpen {
-				// The message text is a frozen contract (downstream substring
-				// matchers and this repo's own tests pin "already assigned
-				// to"); claimConflictError keeps it byte-identical while
-				// wrapping ErrAlreadyClaimed for typed classification.
+				// Do not name a release command here — not `bd unclaim`, not
+				// `bd unclaim --force`. Refusal copy that names one gets
+				// pattern-matched by batch agents into an unclaim+claim
+				// steamroller of live claims (wy-yuclk). Point at the holder;
+				// bd reclaim is safe to name because it only recovers claims
+				// whose lease has already expired. claimConflictError keeps
+				// the message clean while wrapping ErrAlreadyClaimed for
+				// typed classification.
 				return nil, &claimConflictError{msg: fmt.Sprintf(
-					"issue already assigned to %q. Use `bd unclaim %s` to release it before re-claiming", assignee, id)}
+					"issue already assigned to %q — coordinate with the holder; if their claim is abandoned (crashed agent), lease expiry will surface it for bd reclaim", assignee)}
 			}
 			return nil, fmt.Errorf("%w by %s", storage.ErrAlreadyClaimed, assignee)
 		}
 		return nil, fmt.Errorf("%w: status %s", storage.ErrNotClaimable, currentStatus)
+	}
+
+	// Grant the lease: what makes the claim recoverable — a worker that dies
+	// stops heartbeating and bd reclaim later reverts the issue. Lease rows
+	// live in the ephemeral leases table (no Dolt commit, node-local) and are
+	// tier-complete: wisp claims lease through the same table. The grant
+	// honors lease.auto and explicit --lease-ttl requests (ClaimLeaseUpsert).
+	if err := ClaimLeaseUpsert(ctx, tx, id, actor, now); err != nil {
+		return nil, err
 	}
 
 	// Record the claim event.
@@ -174,4 +226,47 @@ func ClaimReadyIssueInTx(
 		return claimed, nil
 	}
 	return nil, nil
+}
+
+// ClaimPoolAliasesInTx returns the pool pseudo-assignee aliases from the
+// claim.pools config key (comma-separated, whitespace-trimmed). An issue
+// assigned to one of these aliases is claimable by ANY actor through the
+// normal claim CAS — the pattern where a dispatcher pre-assigns work to a
+// group alias (e.g. "fable-crew") and members take items from the pool.
+// Issues assigned to a real actor are unaffected. Missing/empty config (the
+// default) disables pool-aware claiming entirely.
+func ClaimPoolAliasesInTx(ctx context.Context, tx DBTX) ([]string, error) {
+	raw, err := GetConfigInTx(ctx, tx, "claim.pools")
+	if err != nil {
+		return nil, err
+	}
+	var pools []string
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			pools = append(pools, p)
+		}
+	}
+	return pools, nil
+}
+
+// ClaimableSourceStatusesInTx returns the set of statuses an issue may be
+// claimed FROM: the built-in "open" status plus any configured custom status
+// whose category is "active" (the same category that surfaces issues in
+// bd ready). Custom statuses in the wip/done/frozen categories are intentionally
+// excluded so claim retains its anti-steal protection (GH-3570) — an
+// in_progress/blocked issue, or a custom alias for one, is never silently
+// re-claimable. Unspecified-category customs are also excluded, matching their
+// absence from bd ready.
+func ClaimableSourceStatusesInTx(ctx context.Context, tx DBTX) ([]string, error) {
+	statuses := []string{string(types.StatusOpen)}
+	customs, err := ResolveCustomStatusesDetailedInTx(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range customs {
+		if s.Category == types.CategoryActive {
+			statuses = append(statuses, s.Name)
+		}
+	}
+	return statuses, nil
 }

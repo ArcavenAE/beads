@@ -32,7 +32,9 @@ func readWispLease(t *testing.T, ctx context.Context, store *DoltStore, id strin
 	t.Helper()
 	var lease timeNull
 	err := store.db.QueryRowContext(ctx, `
-		SELECT status, COALESCE(assignee,''), lease_expires_at, claim_fence FROM wisps WHERE id = ?
+		SELECT w.status, COALESCE(w.assignee,''), l.lease_expires_at, w.claim_fence
+		FROM wisps w LEFT JOIN leases l ON l.issue_id = w.id
+		WHERE w.id = ?
 	`, id).Scan(&status, &assignee, &lease, &fence)
 	if err != nil {
 		t.Fatalf("read wisp lease %s: %v", id, err)

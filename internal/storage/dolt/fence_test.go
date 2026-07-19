@@ -239,10 +239,18 @@ func TestFenceScanPosition(t *testing.T) {
 	seedOpenIssue(t, ctx, store, "fence-scan")
 	lease := time.Date(2031, 1, 2, 3, 4, 5, 0, time.UTC)
 	heartbeat := time.Date(2032, 6, 7, 8, 9, 10, 0, time.UTC)
+	// The lease sentinels live in the leases overlay (LEFT JOIN hydration);
+	// the fence is an issues column. Stamp both directly.
 	if _, err := store.db.ExecContext(ctx, `
-		UPDATE issues SET lease_expires_at = ?, heartbeat_at = ?, claim_fence = 7777 WHERE id = ?
-	`, lease, heartbeat, "fence-scan"); err != nil {
-		t.Fatalf("stamp sentinels: %v", err)
+		INSERT INTO leases (issue_id, holder, granted_at, lease_expires_at, heartbeat_at)
+		VALUES (?, 'sentinel-holder', ?, ?, ?)
+	`, "fence-scan", heartbeat, lease, heartbeat); err != nil {
+		t.Fatalf("stamp lease sentinels: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `
+		UPDATE issues SET claim_fence = 7777 WHERE id = ?
+	`, "fence-scan"); err != nil {
+		t.Fatalf("stamp fence sentinel: %v", err)
 	}
 
 	got, err := store.GetIssue(ctx, "fence-scan")

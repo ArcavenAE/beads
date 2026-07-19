@@ -88,13 +88,30 @@ func ManageStartedAt(oldIssue *types.Issue, updates map[string]interface{}, setC
 }
 
 // ManageLeaseOnUpdate keeps lease ownership coherent when generic updates alter
-// status or assignee. Claim/heartbeat own the normal lease lifecycle, but bd
-// update can transfer or reopen work directly.
-func ManageLeaseOnUpdate(oldIssue *types.Issue, updates map[string]interface{}, setClauses []string, args []interface{}, ctx context.Context) ([]string, []interface{}) {
+// status or assignee. Leases are armed ONLY by the lease-aware verbs — claim
+// (ClaimIssueInTx, bd update --claim, bd ready --claim) and heartbeat — never by
+// a generic update. A bare `bd update -s in_progress -a <who>` is an interactive
+// hand-dole claim: nobody is heartbeating it, so arming a lease here just turns
+// the claim into reclaim-bait that reverts to open after the TTL (bd-9hpgf,
+// GH#4716). This helper therefore only ever CLEARS lease state:
+//
+//   - the update moves the row out of the claimed state (not in_progress, or
+//     unassigned): any lease is stale — clear it.
+//   - the update changes who holds the claim (assignee transfer, or a fresh
+//     transition into in_progress): the previous owner's lease must not count
+//     down against the new holder — clear it. The new holder gets a lease only
+//     via the claim verb; a real worker's next heartbeat re-arms one.
+//   - the update leaves the same claim in place (already in_progress, same
+//     assignee): leave the lease untouched, so a worker's live lease survives
+//     unrelated edits to its issue.
+//
+// Returns true when the update ends/transfers the claim and the issue's lease
+// row must be deleted (DeleteLeaseInTx) after the row update.
+func ManageLeaseOnUpdate(oldIssue *types.Issue, updates map[string]interface{}) bool {
 	rawStatus, hasStatus := updates["status"]
 	rawAssignee, hasAssignee := updates["assignee"]
 	if !hasStatus && !hasAssignee {
-		return setClauses, args
+		return false
 	}
 
 	newStatus := string(oldIssue.Status)
@@ -105,7 +122,7 @@ func ManageLeaseOnUpdate(oldIssue *types.Issue, updates map[string]interface{}, 
 		case types.Status:
 			newStatus = string(v)
 		default:
-			return setClauses, args
+			return false
 		}
 	}
 
@@ -121,15 +138,9 @@ func ManageLeaseOnUpdate(oldIssue *types.Issue, updates map[string]interface{}, 
 		}
 	}
 
-	if newStatus != string(types.StatusInProgress) || newAssignee == "" {
-		setClauses = append(setClauses, "lease_expires_at = NULL", "heartbeat_at = NULL")
-		return setClauses, args
-	}
-
-	now := time.Now().UTC()
-	setClauses = append(setClauses, "lease_expires_at = ?", "heartbeat_at = ?")
-	args = append(args, now.Add(leaseTTL(ctx)), now)
-	return setClauses, args
+	sameClaim := newStatus == string(types.StatusInProgress) && newAssignee != "" &&
+		oldIssue.Status == types.StatusInProgress && newAssignee == oldIssue.Assignee
+	return !sameClaim
 }
 
 // DetermineEventType returns the appropriate event type for an update.
@@ -270,7 +281,8 @@ func updateIssueInTx(ctx context.Context, tx DBTX, id string, updates map[string
 	setClauses, args = ManageStartedAt(oldIssue, updates, setClauses, args)
 
 	// Auto-manage leases when direct updates change status or assignee.
-	setClauses, args = ManageLeaseOnUpdate(oldIssue, updates, setClauses, args, ctx)
+	// Clears stale leases only; arming is reserved for claim/heartbeat.
+	clearLease := ManageLeaseOnUpdate(oldIssue, updates)
 
 	// Ownership transitions through the generic update path bump the fence:
 	// an assignee change, or a reopen (closed→open) — the primary reopen path
@@ -311,6 +323,12 @@ func updateIssueInTx(ctx context.Context, tx DBTX, id string, updates map[string
 		}
 		if rows == 0 {
 			return nil, GuardPreconditionError(ctx, tx, issueTable, id, guard)
+		}
+	}
+
+	if clearLease {
+		if err := DeleteLeaseInTx(ctx, tx, id); err != nil {
+			return nil, err
 		}
 	}
 
