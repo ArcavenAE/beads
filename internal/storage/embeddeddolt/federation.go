@@ -8,11 +8,13 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
@@ -143,6 +145,61 @@ func (s *EmbeddedDoltStore) GetFederationPeer(ctx context.Context, name string) 
 		}
 	}
 	return &row.Peer, nil
+}
+
+// federationEnvMutex serializes mutation of the process-wide
+// DOLT_REMOTE_USER/DOLT_REMOTE_PASSWORD pair, mirroring package dolt's
+// federationEnvMutex: the in-process Dolt engine reads them from the process
+// environment, so concurrent peer operations would otherwise observe each
+// other's credentials.
+var federationEnvMutex sync.Mutex
+
+// withPeerAuth runs fn with the remote-auth username for peer. Credentials
+// stored by add-peer win and override the environment pair as a unit, so an
+// ambient DOLT_REMOTE_PASSWORD never mixes with a stored username (or vice
+// versa); remotes without a stored peer keep the environment fallback.
+func (s *EmbeddedDoltStore) withPeerAuth(ctx context.Context, peer string, fn func(user string) error) error {
+	p, err := s.GetFederationPeer(ctx, peer)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return fn(remoteAuthUser())
+		}
+		return fmt.Errorf("resolve peer credentials: %w", err)
+	}
+	if p.Username == "" && p.Password == "" {
+		return fn(remoteAuthUser())
+	}
+
+	federationEnvMutex.Lock()
+	defer federationEnvMutex.Unlock()
+
+	restoreUser := overrideEnv("DOLT_REMOTE_USER", p.Username)
+	restorePassword := overrideEnv("DOLT_REMOTE_PASSWORD", p.Password)
+	defer func() {
+		restorePassword()
+		restoreUser()
+	}()
+
+	return fn(p.Username)
+}
+
+// overrideEnv sets key to value (unsetting it when value is empty, so an
+// ambient value cannot leak into an operation that stored an empty field)
+// and returns a function restoring the prior state.
+func overrideEnv(key, value string) func() {
+	prev, had := os.LookupEnv(key)
+	if value == "" {
+		_ = os.Unsetenv(key)
+	} else {
+		_ = os.Setenv(key, value)
+	}
+	return func() {
+		if had {
+			_ = os.Setenv(key, prev)
+		} else {
+			_ = os.Unsetenv(key)
+		}
+	}
 }
 
 func (s *EmbeddedDoltStore) ListFederationPeers(ctx context.Context) ([]*storage.FederationPeer, error) {
