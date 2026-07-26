@@ -14,7 +14,7 @@ import (
 	"github.com/steveyegge/beads/internal/storage/uow"
 )
 
-func newProxiedServerUOWProvider(ctx context.Context, beadsDir string) (uow.UnitOfWorkProvider, error) {
+func newProxiedServerUOWProvider(ctx context.Context, beadsDir string, opts ...uow.UOWProviderOption) (uow.UnitOfWorkProvider, error) {
 	if beadsDir == "" {
 		return nil, fmt.Errorf("newProxiedServerUOWProvider: beadsDir must be set")
 	}
@@ -33,10 +33,10 @@ func newProxiedServerUOWProvider(ctx context.Context, beadsDir string) (uow.Unit
 		proxyIdleTimeout = info.IdleTimeout
 	}
 	if info != nil && info.External != nil {
-		return newExternalProxiedServerUOWProvider(ctx, beadsDir, database, info.External, proxyPort, proxyIdleTimeout)
+		return newExternalProxiedServerUOWProvider(ctx, beadsDir, database, info.External, proxyPort, proxyIdleTimeout, opts...)
 	}
 
-	return newManagedProxiedServerUOWProvider(ctx, beadsDir, database, proxyPort, proxyIdleTimeout)
+	return newManagedProxiedServerUOWProvider(ctx, beadsDir, database, proxyPort, proxyIdleTimeout, opts...)
 }
 
 func newExternalProxiedServerUOWProvider(
@@ -45,6 +45,7 @@ func newExternalProxiedServerUOWProvider(
 	external *configfile.ExternalDoltConfig,
 	proxyPort int,
 	proxyIdleTimeout time.Duration,
+	opts ...uow.UOWProviderOption,
 ) (uow.UnitOfWorkProvider, error) {
 	rootPath, err := resolveProxiedServerRootPath(beadsDir)
 	if err != nil {
@@ -78,6 +79,7 @@ func newExternalProxiedServerUOWProvider(
 		os.Getenv(configfile.ExternalDoltPasswordEnvVar),
 		proxyPort,
 		proxyIdleTimeout,
+		opts...,
 	)
 }
 
@@ -86,6 +88,7 @@ func newManagedProxiedServerUOWProvider(
 	beadsDir, database string,
 	proxyPort int,
 	proxyIdleTimeout time.Duration,
+	opts ...uow.UOWProviderOption,
 ) (uow.UnitOfWorkProvider, error) {
 	doltBin, err := exec.LookPath("dolt")
 	if err != nil {
@@ -133,5 +136,6 @@ func newManagedProxiedServerUOWProvider(
 		doltBin,
 		proxyPort,
 		proxyIdleTimeout,
+		opts...,
 	)
 }

@@ -1329,7 +1329,7 @@ var rootCmd = &cobra.Command{
 		// In proxied mode the CLI short-circuits to the uowProvider path and
 		// dispatches through the *_proxied_server.go duals.
 		if proxiedServerMode {
-			p, err := newProxiedServerUOWProvider(rootCtx, beadsDir)
+			p, err := newProxiedServerUOWProvider(rootCtx, beadsDir, uow.WithCreateIfMissing(false))
 			if err != nil {
 				return HandleError("failed to open uow provider: %v", err)
 			}
