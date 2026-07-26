@@ -408,8 +408,13 @@ pointless).`,
 			// overwrite another actor's live claim. Skipped under
 			// --if-assignee: that CAS names the holder explicitly, which is
 			// how sanctioned X→Y transfers (park) stay possible without
-			// --force. A policy refusal, so it exits 1, not 13.
-			if newAssignee, ok := updates["assignee"].(string); ok && ifAssignee == nil {
+			// --force. Also skipped under --claim: the claim CAS is itself
+			// the anti-steal gate (a foreign live claim fails it with the
+			// canonical "already claimed" copy before any field update runs),
+			// and an assignee edit that rides a WON claim only ever touches
+			// the actor's own fresh claim. A policy refusal, so it exits 1,
+			// not 13.
+			if newAssignee, ok := updates["assignee"].(string); ok && ifAssignee == nil && !claimFlag {
 				if err := validateIssueReassignable(id, issue, actor, newAssignee,
 					storeClaimPoolAliases(ctx, issueStore), forceFlag); err != nil {
 					fmt.Fprintf(os.Stderr, "%s\n", err)

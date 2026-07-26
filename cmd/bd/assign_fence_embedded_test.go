@@ -180,6 +180,21 @@ func TestReassignFenceCLI(t *testing.T) {
 		}
 	})
 
+	t.Run("claim_conflict_copy_preserved_under_claim_flag", func(t *testing.T) {
+		// --claim -a X on a foreign live claim must keep failing through the
+		// claim CAS with the canonical "already claimed" copy — the fence
+		// defers to it (the CAS is itself the anti-steal gate, and existing
+		// automation keys on that message).
+		issue := claimAs(t, "holder")
+		out, _ := bdUpdateFailCode(t, bd, dir, issue.ID, "--actor", "thief", "--claim", "--assignee", "thief")
+		if !strings.Contains(out, "already claimed") && !strings.Contains(out, "already assigned") {
+			t.Errorf("expected the claim CAS conflict copy, got:\n%s", out)
+		}
+		if got := bdShow(t, bd, dir, issue.ID); got.Assignee != "holder" {
+			t.Errorf("claim+assignee combo clobbered the row: assignee=%q, want holder", got.Assignee)
+		}
+	})
+
 	t.Run("pool_alias_holder_is_takeable", func(t *testing.T) {
 		// The claim.pools carve-out: --claim deliberately treats a
 		// pool-assigned issue as claimable by any actor; without the same
