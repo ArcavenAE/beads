@@ -355,3 +355,147 @@ func TestNewExternalDoltServerUOWProvider_PreexistingDirtyDatabaseIsNotHealed(t 
 		"SELECT COUNT(*) FROM beads_loser.dolt_status WHERE table_name = 'issues'").Scan(&count))
 	require.Equal(t, 1, count, "issues working-set dirt was discarded by a non-creator init")
 }
+
+// TestNewExternalDoltServerUOWProvider_ExistingDatabaseOpensWithoutCreatePrivilege
+// is the gastownhall/beads#5079 regression: opening an already-initialized
+// database must not attempt CREATE DATABASE, so a least-privilege account (full
+// DML on its own database, no server CREATE privilege) can run reads like
+// `bd list`. Before the probe-first change the open issued a bare CREATE
+// DATABASE on its first attempt and Dolt denied it with Error 1105 ("command
+// denied"), which the retry loop classified as permanent; every command
+// failed, not just writes.
+func TestNewExternalDoltServerUOWProvider_ExistingDatabaseOpensWithoutCreatePrivilege(t *testing.T) {
+	port := testutil.StartIsolatedDoltContainer(t)
+	portInt, err := strconv.Atoi(port)
+	require.NoError(t, err)
+
+	bdBin := buildBDBinary(t)
+	prev := proxy.ResolveExecutable
+	proxy.ResolveExecutable = func() (string, error) { return bdBin, nil }
+	t.Cleanup(func() { proxy.ResolveExecutable = prev })
+
+	t.Setenv("HOME", t.TempDir())
+
+	storeRootDir := t.TempDir()
+	shutdownOnInterrupt(t, storeRootDir)
+	t.Cleanup(func() {
+		if err := proxy.Shutdown(storeRootDir); err != nil {
+			t.Logf("proxy.Shutdown(%s): %v", storeRootDir, err)
+		}
+	})
+	logPath := filepath.Join(t.TempDir(), "server.log")
+	external := configfile.ExternalDoltConfig{Host: "127.0.0.1", Port: portInt}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Root creates and fully initializes the database, then disconnects.
+	initProvider, err := NewExternalDoltServerUOWProvider(
+		ctx,
+		storeRootDir,
+		"beads_restricted",
+		logPath,
+		external,
+		"root",
+		"",
+		0,
+		0,
+	)
+	require.NoError(t, err)
+	require.NoError(t, initProvider.Close(ctx))
+
+	// Provision a least-privilege account: full DML on its own database but no
+	// CREATE privilege anywhere, so CREATE DATABASE is denied (Error 1105)
+	// while reads and writes within the database are allowed.
+	admin, err := sql.Open("mysql", fmt.Sprintf("root:@tcp(127.0.0.1:%d)/?parseTime=true", portInt))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = admin.Close() })
+	_, err = admin.ExecContext(ctx, "CREATE USER 'beads_app'@'%' IDENTIFIED BY 'app-pass'")
+	require.NoError(t, err)
+	_, err = admin.ExecContext(ctx, "GRANT SELECT, INSERT, UPDATE, DELETE ON `beads_restricted`.* TO 'beads_app'@'%'")
+	require.NoError(t, err)
+
+	provider, err := NewExternalDoltServerUOWProvider(
+		ctx,
+		storeRootDir,
+		"beads_restricted",
+		logPath,
+		external,
+		"beads_app",
+		"app-pass",
+		0,
+		0,
+	)
+	require.NoError(t, err, "opening an existing database as a least-privilege account must not attempt CREATE DATABASE")
+	require.NotNil(t, provider)
+	t.Cleanup(func() { _ = provider.Close(context.Background()) })
+
+	sqlProv, ok := provider.(*doltSQLProvider)
+	require.True(t, ok, "expected *doltSQLProvider, got %T", provider)
+
+	var got string
+	require.NoError(t, sqlProv.db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&got))
+	assert.Equal(t, "beads_restricted", got)
+
+	var one int
+	require.NoError(t, sqlProv.db.QueryRowContext(ctx, "SELECT 1").Scan(&one))
+	assert.Equal(t, 1, one)
+}
+
+// TestNewExternalDoltServerUOWProvider_MissingDatabaseWithCreateDisabled
+// verifies that with WithCreateIfMissing(false), opening a database that does
+// not exist fails with a clear, permanent not-found error and creates
+// nothing; only a caller that explicitly initializes a workspace may create
+// one (#2189). The default (true) preserves the historical implicit create.
+func TestNewExternalDoltServerUOWProvider_MissingDatabaseWithCreateDisabled(t *testing.T) {
+	port := testutil.StartIsolatedDoltContainer(t)
+	portInt, err := strconv.Atoi(port)
+	require.NoError(t, err)
+
+	bdBin := buildBDBinary(t)
+	prev := proxy.ResolveExecutable
+	proxy.ResolveExecutable = func() (string, error) { return bdBin, nil }
+	t.Cleanup(func() { proxy.ResolveExecutable = prev })
+
+	t.Setenv("HOME", t.TempDir())
+
+	storeRootDir := t.TempDir()
+	shutdownOnInterrupt(t, storeRootDir)
+	t.Cleanup(func() {
+		if err := proxy.Shutdown(storeRootDir); err != nil {
+			t.Logf("proxy.Shutdown(%s): %v", storeRootDir, err)
+		}
+	})
+	logPath := filepath.Join(t.TempDir(), "server.log")
+	external := configfile.ExternalDoltConfig{Host: "127.0.0.1", Port: portInt}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	provider, err := NewExternalDoltServerUOWProvider(
+		ctx,
+		storeRootDir,
+		"beads_absent",
+		logPath,
+		external,
+		"root",
+		"",
+		0,
+		0,
+		WithCreateIfMissing(false),
+	)
+	if provider != nil {
+		t.Cleanup(func() { _ = provider.Close(context.Background()) })
+	}
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `database "beads_absent" not found on Dolt server`)
+	assert.Contains(t, err.Error(), "bd init")
+
+	// Nothing may have been created by the failed open.
+	admin, err := sql.Open("mysql", fmt.Sprintf("root:@tcp(127.0.0.1:%d)/?parseTime=true", portInt))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = admin.Close() })
+	var name string
+	err = admin.QueryRowContext(ctx, "SHOW DATABASES LIKE 'beads_absent'").Scan(&name)
+	assert.ErrorIs(t, err, sql.ErrNoRows, "a missing-database open with create disabled must not create the database")
+}

@@ -21,6 +21,31 @@ const (
 	defaultProxyIdleTimeout = 30 * time.Second
 )
 
+// UOWProviderOption configures how a proxied-server UOW provider opens its
+// database.
+type UOWProviderOption func(*uowProviderOptions)
+
+type uowProviderOptions struct {
+	createIfMissing bool
+}
+
+// WithCreateIfMissing sets whether the open path may create the database
+// when the probe finds none. The default is true, preserving the historical
+// implicit create. Callers that are not explicitly initializing a workspace
+// should pass false so a missing database is a not-found error instead of a
+// silent create (#2189).
+func WithCreateIfMissing(create bool) UOWProviderOption {
+	return func(o *uowProviderOptions) { o.createIfMissing = create }
+}
+
+func newUOWProviderOptions(opts []UOWProviderOption) uowProviderOptions {
+	o := uowProviderOptions{createIfMissing: true}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
+}
+
 type doltSQLProvider struct {
 	defaultBranch string
 	db            *sql.DB
@@ -61,7 +86,7 @@ func (p *doltSQLProvider) BeginTx(ctx context.Context) (Tx, error) {
 	}, nil
 }
 
-func (p *doltSQLProvider) initSchema(ctx context.Context, database string) error {
+func (p *doltSQLProvider) initSchema(ctx context.Context, database string, createIfMissing bool) error {
 	bo := backoff.NewExponentialBackOff()
 	bo.InitialInterval = 25 * time.Millisecond
 	// This budget must outwait a peer holding the migration lock through a
@@ -69,8 +94,9 @@ func (p *doltSQLProvider) initSchema(ctx context.Context, database string) error
 	// not just a transient blip — it grows as migrations accumulate.
 	bo.MaxElapsedTime = 60 * time.Second
 	// Fresh-bootstrap ownership proof for the #4566 guard self-heal
-	// (gastownhall/beads#5012): the first attempt issues a bare CREATE
-	// DATABASE (no IF NOT EXISTS), so the server arbitrates creation
+	// (gastownhall/beads#5012): a database the probe finds missing is
+	// created with a bare CREATE DATABASE (no IF NOT EXISTS), so the
+	// server arbitrates creation
 	// atomically — success proves THIS init created the database, and an
 	// already-exists refusal (1007) proves it did not. Only the proven
 	// creator passes WithFreshBootstrapHeal: on a database this init
@@ -103,16 +129,33 @@ func (p *doltSQLProvider) initSchema(ctx context.Context, database string) error
 				return backoff.Permanent(fmt.Errorf("uow: creating database: %w", err))
 			}
 		} else {
-			switch err := ddl.CreateDatabase(ctx, database); {
-			case err == nil:
-				created = true
-			case isDatabaseExistsError(err):
-				// Pre-existing (or a concurrent initializer won the create
-				// race): not ours, heal stays off.
-			case isSerializationError(err):
-				return fmt.Errorf("uow: creating database: %w", err)
-			default:
-				return backoff.Permanent(fmt.Errorf("uow: creating database: %w", err))
+			// Probe before any DDL: an existing database is opened without a
+			// CREATE attempt, so an account with no server CREATE privilege
+			// is not denied (Error 1105) opening a database that is already
+			// there. The bare CREATE below still arbitrates creation of a
+			// missing database exactly as before.
+			exists, err := ddl.DatabaseExists(ctx, database)
+			if err != nil {
+				if isSerializationError(err) {
+					return fmt.Errorf("uow: probing database: %w", err)
+				}
+				return backoff.Permanent(fmt.Errorf("uow: probing database: %w", err))
+			}
+			if !exists {
+				if !createIfMissing {
+					return backoff.Permanent(fmt.Errorf("uow: database %q not found on Dolt server; run 'bd init' to create it", database))
+				}
+				switch err := ddl.CreateDatabase(ctx, database); {
+				case err == nil:
+					created = true
+				case isDatabaseExistsError(err):
+					// A concurrent initializer won the create race: not ours,
+					// heal stays off.
+				case isSerializationError(err):
+					return fmt.Errorf("uow: creating database: %w", err)
+				default:
+					return backoff.Permanent(fmt.Errorf("uow: creating database: %w", err))
+				}
 			}
 		}
 		if err := ddl.UseDatabase(ctx, database); err != nil {
@@ -156,7 +199,7 @@ func openDB(ctx context.Context, dsn string) (*sql.DB, error) {
 	return conn, nil
 }
 
-func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUser, rootPassword, tlsConfigName string) (UnitOfWorkProvider, error) {
+func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUser, rootPassword, tlsConfigName string, createIfMissing bool) (UnitOfWorkProvider, error) {
 	initDB, err := openDB(ctx, buildDSN(ep, "", rootUser, rootPassword, tlsConfigName))
 	if err != nil {
 		return nil, err
@@ -167,7 +210,7 @@ func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUse
 		db:            initDB,
 	}
 
-	if err := initProvider.initSchema(ctx, database); err != nil {
+	if err := initProvider.initSchema(ctx, database, createIfMissing); err != nil {
 		_ = initDB.Close()
 		return nil, fmt.Errorf("uow: init schema: %w", err)
 	}
