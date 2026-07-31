@@ -33,7 +33,9 @@ import (
 	"github.com/steveyegge/beads/internal/remotecache"
 	"github.com/steveyegge/beads/internal/routing"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/backends"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	dbidentifier "github.com/steveyegge/beads/internal/storage/domain/db"
 	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/storage/uow"
 	"github.com/steveyegge/beads/internal/telemetry"
@@ -44,12 +46,13 @@ import (
 )
 
 var (
-	changeDir   string
-	dbPath      string
-	actor       string
-	store       storage.DoltStorage
-	uowProvider uow.UnitOfWorkProvider
-	jsonOutput  bool
+	changeDir    string
+	dbPath       string
+	databaseFlag string
+	actor        string
+	store        storage.DoltStorage
+	uowProvider  uow.UnitOfWorkProvider
+	jsonOutput   bool
 
 	// Signal-aware context for graceful cancellation
 	rootCtx    context.Context
@@ -85,7 +88,7 @@ var (
 	storeIsReadOnly   bool               // Track if store was opened read-only (for staleness checks)
 	ignoreSchemaSkew  bool               // Proceed despite forward schema drift
 	lockTimeout       = 30 * time.Second // Dolt open timeout (fixed default)
-	profileEnabled    bool
+	cpuProfileEnabled bool
 	profileFile       *os.File
 	traceFile         *os.File
 	memProfilePath    string
@@ -555,7 +558,7 @@ func refreshBoundCommandConfig(cmd *cobra.Command) {
 		readonlyMode = config.GetBool("readonly")
 	}
 	if !root.PersistentFlags().Changed("actor") {
-		actor = config.GetString("actor")
+		actor = resolveConfiguredActor()
 	}
 	if !root.PersistentFlags().Changed("dolt-auto-commit") {
 		doltAutoCommit = config.GetString("dolt.auto-commit")
@@ -589,6 +592,22 @@ func resolveCommandBeadsDir(dbPath string) string {
 	// No candidate matched — fall back to parent directory of the db path.
 	// This handles bootstrap/init where no metadata.json exists yet.
 	return filepath.Dir(dbPath)
+}
+
+// resolveConfiguredActor returns the actor implied by env/config when no
+// explicit --actor flag was passed, honoring the documented priority
+// BEADS_ACTOR > BD_ACTOR (deprecated) > config.yaml `actor`.
+//
+// viper's AutomaticEnv binds the deprecated BD_ACTOR to the "actor" key (env
+// prefix "BD"), and it is consulted ahead of any explicit binding — so
+// config.GetString("actor") alone returns BD_ACTOR's value even when
+// BEADS_ACTOR is also set, silently letting the deprecated alias win (GH#4645).
+// Check BEADS_ACTOR explicitly first so the primary override outranks it.
+func resolveConfiguredActor() string {
+	if beadsActor := os.Getenv("BEADS_ACTOR"); beadsActor != "" {
+		return beadsActor
+	}
+	return config.GetString("actor")
 }
 
 // getActorWithGit returns the actor for audit trails with git config fallback.
@@ -655,7 +674,8 @@ func init() {
 
 	// Register persistent flags
 	rootCmd.PersistentFlags().StringVarP(&changeDir, "directory", "C", "", "Change to this directory before running the command (like git -C)")
-	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "", "Database path (default: auto-discover .beads/*.db)")
+	rootCmd.PersistentFlags().StringVar(&dbPath, "db", "", "Database path (default: auto-discover .beads/*.db). In proxied-server mode, a value that isn't an existing path is treated as a database name override (see --database)")
+	rootCmd.PersistentFlags().StringVar(&databaseFlag, "database", "", "Run against a different server database for this invocation, without changing the project's configured database (proxied-server mode only)")
 	rootCmd.PersistentFlags().StringVar(&actor, "actor", "", "Actor name for audit trail (default: $BEADS_ACTOR, git user.name, $USER)")
 	rootCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
 	rootCmd.PersistentFlags().String("format", "", "Output format (json). Alias for --json")
@@ -664,7 +684,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&readonlyMode, "readonly", false, "Read-only mode: block write operations (for worker sandboxes)")
 	rootCmd.PersistentFlags().BoolVar(&globalFlag, "global", false, "Use the global shared-server database (beads_global)")
 	rootCmd.PersistentFlags().StringVar(&doltAutoCommit, "dolt-auto-commit", "", "Dolt auto-commit policy (off|on|batch). 'on': commit after each write. 'batch': defer commits to bd dolt commit; uncommitted changes persist in the working set until then. SIGTERM/SIGHUP flush pending batch commits. Default: off. Override via config key dolt.auto-commit")
-	rootCmd.PersistentFlags().BoolVar(&profileEnabled, "profile", false, "Generate CPU profile for performance analysis")
+	rootCmd.PersistentFlags().BoolVar(&cpuProfileEnabled, "cpu-profile", false, "Generate CPU profile for performance analysis")
 	rootCmd.PersistentFlags().StringVar(&memProfilePath, "mem-profile", "", "Write heap profile to FILE on exit (also respects BEADS_MEM_PROFILE)")
 	rootCmd.PersistentFlags().BoolVarP(&verboseFlag, "verbose", "v", false, "Enable verbose/debug output")
 	rootCmd.PersistentFlags().BoolVarP(&quietFlag, "quiet", "q", false, "Suppress non-essential output (errors only)")
@@ -757,7 +777,7 @@ var rootCmd = &cobra.Command{
 		// No subcommand - show help
 		_ = cmd.Help() // Help() always returns nil for cobra commands
 	},
-	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) (retErr error) {
 		applyNoColorFlag()
 
 		// Initialize CommandContext to hold runtime state (replaces scattered globals)
@@ -862,6 +882,18 @@ var rootCmd = &cobra.Command{
 				WasSet bool
 			}{readonlyMode, true}
 		}
+		var dbNameFromDBFlag string
+		if cmd.Name() != "init" && cmd.Root().PersistentFlags().Changed("db") && dbPath != "" &&
+			dbidentifier.ValidateIdentifier(dbPath) == nil {
+			if _, statErr := os.Stat(dbPath); statErr != nil {
+				if !os.IsNotExist(statErr) {
+					return HandleError("--db %q: %v", dbPath, statErr)
+				}
+				dbNameFromDBFlag = dbPath
+				dbPath = ""
+			}
+		}
+
 		if !cmd.Root().PersistentFlags().Changed("db") && dbPath == "" &&
 			os.Getenv("BEADS_DB") == "" && os.Getenv("BD_DB") == "" && os.Getenv("BEADS_DIR") == "" {
 			dbPath = config.GetString("db")
@@ -872,7 +904,7 @@ var rootCmd = &cobra.Command{
 			}{dbPath, true}
 		}
 		if !cmd.Root().PersistentFlags().Changed("actor") && actor == "" {
-			actor = config.GetString("actor")
+			actor = resolveConfiguredActor()
 		} else if cmd.Root().PersistentFlags().Changed("actor") {
 			flagOverrides["actor"] = struct {
 				Value  interface{}
@@ -1029,7 +1061,7 @@ var rootCmd = &cobra.Command{
 		}
 
 		// Performance profiling setup
-		if profileEnabled {
+		if cpuProfileEnabled {
 			timestamp := time.Now().Format("20060102-150405")
 			if f, _ := os.Create(fmt.Sprintf("bd-profile-%s-%s.prof", cmd.Name(), timestamp)); f != nil {
 				profileFile = f
@@ -1060,12 +1092,13 @@ var rootCmd = &cobra.Command{
 		if dbPath == "" {
 			if bd := beads.FindBeadsDir(); bd != "" {
 				cfg, cfgErr := configfile.Load(bd)
-				if cfgErr != nil || cfg != nil && (cfg.IsDoltProxiedServerMode() || !configfile.IsSupportedBackend(cfg.Backend)) {
-					// Proxied-server and removed-backend workspaces may have no
-					// local Dolt database file. Invalid or unknown metadata likewise must
-					// reach config validation instead of becoming a generic "no database"
-					// result. metadata.json identifies the workspace so store selection can
-					// route or reject it explicitly.
+				if cfgErr != nil || cfg != nil && (cfg.IsDoltProxiedServerMode() ||
+					registeredBackendWorkspaceIsBeadsDir(cfg) ||
+					!configfile.IsSupportedBackend(cfg.Backend)) {
+					// Proxied-server, registered remote, and removed-backend
+					// workspaces may have no local Dolt database file. Invalid
+					// or unknown metadata likewise must reach config validation
+					// instead of becoming a generic "no database" result.
 					dbPath = bd
 				}
 			}
@@ -1143,6 +1176,30 @@ var rootCmd = &cobra.Command{
 		beadsDir := resolveCommandBeadsDir(dbPath)
 		prepareSelectedCommandContext(beadsDir, true)
 		refreshBoundCommandConfig(cmd)
+
+		// Workspace operation gate: every command that reaches this point
+		// will open the store (the skipsStoreInit early return is above),
+		// so take the workspace + physical-root gates now, in the final
+		// mode (SHARED for normal commands, EXCLUSIVE for bd backup
+		// restore — there is no upgrade path). See workspace_gate.go for
+		// the fail-open/fail-closed posture. The handle is released in
+		// PersistentPostRunE after store close; if this PreRunE fails
+		// later, cobra never runs PostRunE, so the deferred release below
+		// covers the PreRunE error paths after acquisition.
+		if err := acquireCommandWorkspaceGates(rootCtx, cmd, beadsDir); err != nil {
+			return err
+		}
+		defer func() {
+			if retErr != nil {
+				// Gate-outlives-store: a PreRunE failure AFTER the store
+				// opened (cobra will skip PostRunE) must close the
+				// store/provider before the gates drop, or maintenance
+				// could start against un-quiesced storage.
+				closeStoreBeforeGateRelease()
+				releaseWorkspaceGates()
+			}
+		}()
+
 		if _, err := getDoltAutoCommitMode(); err != nil {
 			return HandleError("%v", err)
 		}
@@ -1326,10 +1383,26 @@ var rootCmd = &cobra.Command{
 		// other helper paths stay in lockstep with the main command path.
 		dolt.ApplyCLIAutoStart(beadsDir, doltCfg)
 
+		databaseOverride := databaseFlag
+		if dbNameFromDBFlag != "" {
+			if databaseOverride != "" && databaseOverride != dbNameFromDBFlag {
+				return HandleError("conflicting database selection: --db=%q vs --database=%q", dbNameFromDBFlag, databaseOverride)
+			}
+			databaseOverride = dbNameFromDBFlag
+		}
+		if databaseOverride != "" {
+			if !proxiedServerMode {
+				return HandleErrorRespectJSON("--database (or a --db value naming a database) is only supported in proxied-server mode")
+			}
+			if err := dbidentifier.ValidateIdentifier(databaseOverride); err != nil {
+				return HandleErrorRespectJSON("%v", err)
+			}
+		}
+
 		// In proxied mode the CLI short-circuits to the uowProvider path and
 		// dispatches through the *_proxied_server.go duals.
 		if proxiedServerMode {
-			p, err := newProxiedServerUOWProvider(rootCtx, beadsDir)
+			p, err := newProxiedServerUOWProvider(rootCtx, beadsDir, databaseOverride)
 			if err != nil {
 				return HandleError("failed to open uow provider: %v", err)
 			}
@@ -1362,12 +1435,25 @@ var rootCmd = &cobra.Command{
 		// Removing them WILL cause unrecoverable data corruption and data loss.
 		// Dolt manages these files itself; external interference is never safe.
 
-		store, err = newDoltStore(rootCtx, doltCfg)
+		if backend, ok := backends.Lookup(cfg.GetBackend()); ok {
+			if useReadOnly {
+				store, err = backend.OpenReadOnly(rootCtx, beadsDir)
+			} else {
+				store, err = backend.Open(rootCtx, beadsDir)
+			}
+		} else {
+			store, err = newDoltStore(rootCtx, doltCfg)
+		}
 
 		// Track final read-only state for staleness checks (GH#1089)
 		storeIsReadOnly = doltCfg.ReadOnly
 
 		if err != nil {
+			// A failed factory can return a typed-nil concrete pointer,
+			// which the interface assignment above makes non-nil; the
+			// gate-release cleanup would then call Close on a nil
+			// receiver and panic. No store was opened, so drop it.
+			store = nil
 			// Check for fresh clone scenario
 			if handleFreshCloneError(err) {
 				return SilentExit()
@@ -1423,10 +1509,13 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
-		// Initialize hook runner
-		// dbPath is .beads/something.db, so workspace root is parent of .beads
-		if dbPath != "" {
-			beadsDir := filepath.Dir(dbPath)
+		// Initialize hook runner using the .beads directory resolved above via
+		// resolveCommandBeadsDir. Do not use filepath.Dir(dbPath): for a
+		// registered WorkspaceIsBeadsDir backend dbPath is the .beads directory
+		// itself, so filepath.Dir(dbPath) would load hooks from the repo root
+		// (<repo>/hooks) instead of .beads/hooks; custom dolt_data_dir layouts
+		// can likewise place the Dolt data outside .beads.
+		if beadsDir != "" {
 			hookRunner = hooks.NewRunner(filepath.Join(beadsDir, "hooks"))
 		}
 
@@ -1444,7 +1533,9 @@ var rootCmd = &cobra.Command{
 		// Templates are loaded after auto-import to ensure the database is up-to-date.
 		// Skip for import command to avoid conflicts during import operations.
 		if cmd.Name() != "import" && store != nil {
-			beadsDir := filepath.Dir(dbPath)
+			// Reuse the resolved .beads directory (see the hook runner note
+			// above) so a registered WorkspaceIsBeadsDir workspace loads
+			// .beads/molecules.jsonl rather than <repo>/molecules.jsonl.
 			loader := molecules.NewLoader(store)
 			if result, err := loader.LoadAll(rootCtx, beadsDir); err != nil {
 				debug.Logf("warning: failed to load molecules: %v", err)
@@ -1462,6 +1553,17 @@ var rootCmd = &cobra.Command{
 	},
 	PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
 		defer restoreChangeDirSelection()
+		// Release the workspace/physical-root gates on EVERY exit from
+		// PostRunE — deferred so the early error returns below cannot leak
+		// the handle past the function. Ordering is enforced, not assumed:
+		// the success path closes uowProvider/store itself (and nils them),
+		// making the close call here a no-op; on the early error returns
+		// the store is still open, so it is closed HERE, before the gates
+		// drop — gates must always outlive the store.
+		defer func() {
+			closeStoreBeforeGateRelease()
+			releaseWorkspaceGates()
+		}()
 
 		if proxiedServerMode {
 			if uowProvider != nil {
@@ -1532,6 +1634,9 @@ var rootCmd = &cobra.Command{
 
 			if store != nil {
 				_ = store.Close() // Best effort cleanup
+				// Mark closed so the deferred gate-release cleanup above
+				// does not double-close it.
+				store = nil
 			}
 		}
 
