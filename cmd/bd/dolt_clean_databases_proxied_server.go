@@ -14,7 +14,7 @@ func runDoltCleanDatabasesProxied(ctx context.Context, beadsDir string, opts cle
 	// deliberate (#5087 review): the configured database being dropped
 	// server-side is precisely the broken state this command exists to clean
 	// up from, so its open must not fail on (or recreate) that database.
-	provider, err := newProxiedServerUOWProviderAdopting(ctx, beadsDir, "", uow.WithCreateIfMissing(false))
+	provider, err := newProxiedServerUOWProviderAdopting(ctx, beadsDir, "", uow.WithNoDatabaseBind())
 	if err != nil {
 		return HandleError("failed to open uow provider: %v", err)
 	}

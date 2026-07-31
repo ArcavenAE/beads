@@ -27,6 +27,7 @@ type UOWProviderOption func(*uowProviderOptions)
 
 type uowProviderOptions struct {
 	createIfMissing bool
+	noDatabaseBind  bool
 }
 
 // WithCreateIfMissing sets whether the open path may create the database
@@ -39,12 +40,37 @@ func WithCreateIfMissing(create bool) UOWProviderOption {
 	return func(o *uowProviderOptions) { o.createIfMissing = create }
 }
 
+// WithNoDatabaseBind opens a server-wide maintenance connection: the open
+// neither probes, creates, USEs, nor migrates the configured database, and
+// the returned provider has no default database bound. Only server-scoped
+// operations (MaintenanceProvider.RunNonTx issuing statements like SHOW
+// DATABASES or DROP DATABASE) are meaningful on such a provider; per-database
+// UnitOfWork/Tx use requires a bound database. Used by
+// `bd dolt clean-databases`, which must work precisely when the configured
+// database has been dropped server-side.
+func WithNoDatabaseBind() UOWProviderOption {
+	return func(o *uowProviderOptions) { o.noDatabaseBind = true }
+}
+
 func newUOWProviderOptions(opts []UOWProviderOption) uowProviderOptions {
 	o := uowProviderOptions{createIfMissing: false}
 	for _, opt := range opts {
 		opt(&o)
 	}
 	return o
+}
+
+// CreateIfMissingForTest reports the create-if-missing policy a set of
+// provider options resolves to. Test support only (policy-wiring tests in
+// cmd/bd assert which policy each call site passes).
+func CreateIfMissingForTest(opts ...UOWProviderOption) bool {
+	return newUOWProviderOptions(opts).createIfMissing
+}
+
+// NoDatabaseBindForTest reports whether a set of provider options resolves
+// to a server-wide, no-database-bind open. Test support only.
+func NoDatabaseBindForTest(opts ...UOWProviderOption) bool {
+	return newUOWProviderOptions(opts).noDatabaseBind
 }
 
 type doltSQLProvider struct {
@@ -233,7 +259,21 @@ func openDB(ctx context.Context, dsn string) (*sql.DB, error) {
 	return conn, nil
 }
 
-func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUser, rootPassword, tlsConfigName string, teamServer bool, expectedProjectID string, createIfMissing bool) (UnitOfWorkProvider, error) {
+func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUser, rootPassword, tlsConfigName string, teamServer bool, expectedProjectID string, o uowProviderOptions) (UnitOfWorkProvider, error) {
+	if o.noDatabaseBind {
+		// Server-wide maintenance open (WithNoDatabaseBind): no probe, no
+		// create, no USE, no migrate — the configured database may not even
+		// exist. The connection carries no default database.
+		dbConn, err := openDB(ctx, buildDSN(ep, "", rootUser, rootPassword, tlsConfigName))
+		if err != nil {
+			return nil, err
+		}
+		return &doltSQLProvider{
+			defaultBranch: defaultBranch,
+			db:            dbConn,
+		}, nil
+	}
+
 	initDB, err := openDB(ctx, buildDSN(ep, "", rootUser, rootPassword, tlsConfigName))
 	if err != nil {
 		return nil, err
@@ -246,7 +286,7 @@ func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUse
 		expectedProjectID: expectedProjectID,
 	}
 
-	if err := initProvider.initSchema(ctx, database, createIfMissing); err != nil {
+	if err := initProvider.initSchema(ctx, database, o.createIfMissing); err != nil {
 		_ = initDB.Close()
 		return nil, fmt.Errorf("uow: init schema: %w", err)
 	}
