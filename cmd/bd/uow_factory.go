@@ -14,12 +14,19 @@ import (
 	"github.com/steveyegge/beads/internal/storage/uow"
 )
 
+// openProxiedServerUOWProviderFn is a seam for the create-policy wiring test
+// (proxied_create_policy_test.go), which swaps it to capture which
+// uow.UOWProviderOption set each proxied call site passes without connecting
+// to a server. Production code always points it at
+// openProxiedServerUOWProvider.
+var openProxiedServerUOWProviderFn = openProxiedServerUOWProvider
+
 // newProxiedServerUOWProvider opens the proxied-server provider and, in
 // team-server mode, asserts that the shared bts-managed database is serving
 // THIS workspace's project (gastownhall/beads: the proxied-path sibling of the
 // gateway's DoltStore.verifyProjectIdentity guard).
 func newProxiedServerUOWProvider(ctx context.Context, beadsDir, databaseOverride string, opts ...uow.UOWProviderOption) (uow.UnitOfWorkProvider, error) {
-	return openProxiedServerUOWProvider(ctx, beadsDir, databaseOverride, assertWorkspaceIdentity, opts...)
+	return openProxiedServerUOWProviderFn(ctx, beadsDir, databaseOverride, assertWorkspaceIdentity, opts...)
 }
 
 // newProxiedServerUOWProviderAdopting skips that assertion. Only two callers
@@ -28,7 +35,7 @@ func newProxiedServerUOWProvider(ctx context.Context, beadsDir, databaseOverride
 // locally-minted placeholder would reject every correct init), and server-wide
 // database maintenance, which is not scoped to one project's database.
 func newProxiedServerUOWProviderAdopting(ctx context.Context, beadsDir, databaseOverride string, opts ...uow.UOWProviderOption) (uow.UnitOfWorkProvider, error) {
-	return openProxiedServerUOWProvider(ctx, beadsDir, databaseOverride, adoptWorkspaceIdentity, opts...)
+	return openProxiedServerUOWProviderFn(ctx, beadsDir, databaseOverride, adoptWorkspaceIdentity, opts...)
 }
 
 // identityPosture selects whether a proxied open asserts the workspace's
