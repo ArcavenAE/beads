@@ -96,6 +96,7 @@ func TestNewExternalDoltServerUOWProvider_EndToEnd(t *testing.T) {
 		0,
 		false,
 		"",
+		WithCreateIfMissing(true),
 	)
 	require.NoError(t, err)
 	require.NotNil(t, provider)
@@ -173,6 +174,7 @@ func TestNewExternalDoltServerUOWProvider_ConcurrentInstantiation(t *testing.T) 
 				0,
 				false,
 				"",
+				WithCreateIfMissing(true),
 			)
 			results[i] = result{provider: p, err: err}
 		}()
@@ -268,6 +270,7 @@ func TestNewExternalDoltServerUOWProvider_FreshInitSelfHealsAfterMidPassFailure(
 		0,
 		false,
 		"",
+		WithCreateIfMissing(true),
 	)
 	require.NoError(t, err, "fresh init must converge after a mid-pass transient failure, not trip the #4566 guard on its own bootstrap debris")
 	require.NotNil(t, provider)
@@ -410,6 +413,9 @@ func TestNewExternalDoltServerUOWProvider_ExistingDatabaseOpensWithoutCreatePriv
 		"",
 		0,
 		0,
+		false,
+		"",
+		WithCreateIfMissing(true),
 	)
 	require.NoError(t, err)
 	require.NoError(t, initProvider.Close(ctx))
@@ -435,6 +441,8 @@ func TestNewExternalDoltServerUOWProvider_ExistingDatabaseOpensWithoutCreatePriv
 		"app-pass",
 		0,
 		0,
+		false,
+		"",
 	)
 	require.NoError(t, err, "opening an existing database as a least-privilege account must not attempt CREATE DATABASE")
 	require.NotNil(t, provider)
@@ -453,10 +461,12 @@ func TestNewExternalDoltServerUOWProvider_ExistingDatabaseOpensWithoutCreatePriv
 }
 
 // TestNewExternalDoltServerUOWProvider_MissingDatabaseWithCreateDisabled
-// verifies that with WithCreateIfMissing(false), opening a database that does
-// not exist fails with a clear, permanent not-found error and creates
-// nothing; only a caller that explicitly initializes a workspace may create
-// one (#2189). The default (true) preserves the historical implicit create.
+// verifies that with create-if-missing disabled (the default; the explicit
+// option below documents intent), opening a database that does not exist
+// fails with a clear, permanent not-found error that points at both bd init
+// (new database) and bd bootstrap (existing project), and creates nothing;
+// only a caller that explicitly initializes a workspace may create one
+// (#2189).
 func TestNewExternalDoltServerUOWProvider_MissingDatabaseWithCreateDisabled(t *testing.T) {
 	port := testutil.StartIsolatedDoltContainer(t)
 	portInt, err := strconv.Atoi(port)
@@ -492,6 +502,8 @@ func TestNewExternalDoltServerUOWProvider_MissingDatabaseWithCreateDisabled(t *t
 		"",
 		0,
 		0,
+		false,
+		"",
 		WithCreateIfMissing(false),
 	)
 	if provider != nil {
@@ -499,7 +511,8 @@ func TestNewExternalDoltServerUOWProvider_MissingDatabaseWithCreateDisabled(t *t
 	}
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `database "beads_absent" not found on Dolt server`)
-	assert.Contains(t, err.Error(), "bd init")
+	assert.Contains(t, err.Error(), "run 'bd init' to create a new database")
+	assert.Contains(t, err.Error(), "or 'bd bootstrap' to restore an existing project")
 
 	// Nothing may have been created by the failed open.
 	admin, err := sql.Open("mysql", fmt.Sprintf("root:@tcp(127.0.0.1:%d)/?parseTime=true", portInt))

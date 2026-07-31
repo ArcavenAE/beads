@@ -40,7 +40,7 @@ func WithCreateIfMissing(create bool) UOWProviderOption {
 }
 
 func newUOWProviderOptions(opts []UOWProviderOption) uowProviderOptions {
-	o := uowProviderOptions{createIfMissing: true}
+	o := uowProviderOptions{createIfMissing: false}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -177,7 +177,7 @@ func (p *doltSQLProvider) initSchema(ctx context.Context, database string, creat
 			}
 			if !exists {
 				if !createIfMissing {
-					return backoff.Permanent(fmt.Errorf("uow: database %q not found on Dolt server; run 'bd init' to create it", database))
+					return backoff.Permanent(fmt.Errorf("uow: database %q not found on Dolt server; run 'bd init' to create a new database, or 'bd bootstrap' to restore an existing project", database))
 				}
 				switch err := ddl.CreateDatabase(ctx, database); {
 				case err == nil:
