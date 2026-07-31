@@ -655,7 +655,16 @@ type importChangePlan struct {
 	NewCount int
 }
 
-func filterStaleImportIssues(ctx context.Context, store storage.DoltStorage, issues []*types.Issue) ([]*types.Issue, []string, importChangePlan, error) {
+// issuesByIDReader is the only storage capability filterStaleImportIssues
+// needs. Narrowing it from storage.DoltStorage lets the proxied-server import
+// path reuse this stale/tie guard through its unit-of-work, so both paths
+// share one implementation of the bd-pkim8/bd-hj85c semantics instead of
+// growing a second copy that can drift.
+type issuesByIDReader interface {
+	GetIssuesByIDs(ctx context.Context, ids []string) ([]*types.Issue, error)
+}
+
+func filterStaleImportIssues(ctx context.Context, store issuesByIDReader, issues []*types.Issue) ([]*types.Issue, []string, importChangePlan, error) {
 	var plan importChangePlan
 	ids := make([]string, 0, len(issues))
 	seen := make(map[string]struct{}, len(issues))
@@ -775,7 +784,7 @@ func filterStaleImportIssues(ctx context.Context, store storage.DoltStorage, iss
 // --allow-stale write) imports every row regardless of timestamp ordering,
 // so no row is ever stale-skipped or tie-kept — existence is the only
 // question.
-func classifyImportIssuesExistence(ctx context.Context, store storage.DoltStorage, issues []*types.Issue) (importChangePlan, error) {
+func classifyImportIssuesExistence(ctx context.Context, store issuesByIDReader, issues []*types.Issue) (importChangePlan, error) {
 	var plan importChangePlan
 	ids := make([]string, 0, len(issues))
 	seen := make(map[string]struct{}, len(issues))
@@ -831,7 +840,7 @@ func classifyImportIssuesExistence(ctx context.Context, store storage.DoltStorag
 // classifyDryRunImport runs the same id lookup as a real import, without
 // writing anything, so --dry-run can report create/update/skip counts
 // instead of treating every row as a create (GH#4901).
-func classifyDryRunImport(ctx context.Context, store storage.DoltStorage, issues []*types.Issue, allowStale bool) (*ImportResult, error) {
+func classifyDryRunImport(ctx context.Context, store issuesByIDReader, issues []*types.Issue, allowStale bool) (*ImportResult, error) {
 	if len(issues) == 0 {
 		return &ImportResult{}, nil
 	}

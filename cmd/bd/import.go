@@ -117,9 +117,6 @@ func init() {
 }
 
 func runImport(cmd *cobra.Command, args []string) error {
-	if usesProxiedServer() {
-		return HandleErrorRespectJSON("import is not supported in proxied-server mode")
-	}
 	evt := metrics.NewCommandEvent("import")
 	defer func() {
 		if c := metrics.Global(); c != nil {
@@ -212,16 +209,13 @@ type importResultJSON struct {
 	DryRun              bool           `json:"dry_run,omitempty"`
 }
 
-func runImportFromReader(ctx context.Context, r io.Reader, source string) error {
-	if store == nil {
-		return fmt.Errorf("no database — run 'bd init' or 'bd bootstrap' first")
-	}
-
+// parseImportJSONL reads the import JSONL stream into issues and memory
+// records. Extracted from runImportFromReader so the proxied-server path
+// consumes exactly the same wire semantics (header skip, memory records,
+// tombstone drop, wisp alias, SetDefaults) rather than reimplementing them.
+func parseImportJSONL(r io.Reader) (issues []*types.Issue, memories []memoryRecord, err error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
-
-	var issues []*types.Issue
-	var memories []memoryRecord
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -231,7 +225,7 @@ func runImportFromReader(ctx context.Context, r io.Reader, source string) error 
 
 		var peek map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(line), &peek); err != nil {
-			return fmt.Errorf("failed to parse JSONL line: %w", err)
+			return nil, nil, fmt.Errorf("failed to parse JSONL line: %w", err)
 		}
 
 		// Skip the optional beads-jsonl header record (§J1.3). A canonical
@@ -251,7 +245,7 @@ func runImportFromReader(ctx context.Context, r io.Reader, source string) error 
 			if err := json.Unmarshal(rawType, &typeStr); err == nil && typeStr == "memory" {
 				var mem memoryRecord
 				if err := json.Unmarshal([]byte(line), &mem); err != nil {
-					return fmt.Errorf("failed to parse memory record: %w", err)
+					return nil, nil, fmt.Errorf("failed to parse memory record: %w", err)
 				}
 				if mem.Key != "" && mem.Value != "" {
 					memories = append(memories, mem)
@@ -262,7 +256,7 @@ func runImportFromReader(ctx context.Context, r io.Reader, source string) error 
 
 		var issue types.Issue
 		if err := json.Unmarshal([]byte(line), &issue); err != nil {
-			return fmt.Errorf("failed to parse issue from JSONL: %w", err)
+			return nil, nil, fmt.Errorf("failed to parse issue from JSONL: %w", err)
 		}
 		if issue.Status == "tombstone" {
 			continue
@@ -277,7 +271,23 @@ func runImportFromReader(ctx context.Context, r io.Reader, source string) error 
 		issues = append(issues, &issue)
 	}
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("failed to scan JSONL: %w", err)
+		return nil, nil, fmt.Errorf("failed to scan JSONL: %w", err)
+	}
+
+	return issues, memories, nil
+}
+
+func runImportFromReader(ctx context.Context, r io.Reader, source string) error {
+	if usesProxiedServer() {
+		return runImportProxiedServer(ctx, r, source)
+	}
+	if store == nil {
+		return fmt.Errorf("no database — run 'bd init' or 'bd bootstrap' first")
+	}
+
+	issues, memories, err := parseImportJSONL(r)
+	if err != nil {
+		return err
 	}
 
 	// Dedup: skip issues whose title matches an existing open issue
