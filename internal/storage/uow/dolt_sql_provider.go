@@ -30,16 +30,17 @@ type uowProviderOptions struct {
 }
 
 // WithCreateIfMissing sets whether the open path may create the database
-// when the probe finds none. The default is true, preserving the historical
-// implicit create. Callers that are not explicitly initializing a workspace
-// should pass false so a missing database is a not-found error instead of a
-// silent create (#2189).
+// when the probe finds none. The default is false: a missing database is a
+// not-found error, never a silent create (#2189). Only a caller that is
+// explicitly initializing a workspace (bd init) should pass true. The
+// default is deliberately the safe behavior so a future caller that forgets
+// the option cannot re-open the implicit-create hole.
 func WithCreateIfMissing(create bool) UOWProviderOption {
 	return func(o *uowProviderOptions) { o.createIfMissing = create }
 }
 
 func newUOWProviderOptions(opts []UOWProviderOption) uowProviderOptions {
-	o := uowProviderOptions{createIfMissing: true}
+	o := uowProviderOptions{createIfMissing: false}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -49,6 +50,14 @@ func newUOWProviderOptions(opts []UOWProviderOption) uowProviderOptions {
 type doltSQLProvider struct {
 	defaultBranch string
 	db            *sql.DB
+	// teamServer: schema is owned by beads-team-server (bts) — bd never
+	// creates the database or migrates, only verifies the schema version.
+	teamServer bool
+	// expectedProjectID is the calling workspace's project identity, asserted
+	// against the team-server database on open. Empty means "no assertion
+	// available" (bd init, which adopts; server-wide maintenance; a workspace
+	// predating project identity) and skips the check.
+	expectedProjectID string
 }
 
 var (
@@ -121,6 +130,31 @@ func (p *doltSQLProvider) initSchema(ctx context.Context, database string, creat
 		defer conn.Close()
 
 		ddl := db.NewDDLSQLRepository(conn)
+		if p.teamServer {
+			if err := ddl.UseDatabase(ctx, database); err != nil {
+				if isSerializationError(err) {
+					return fmt.Errorf("uow: switching to database: %w", err)
+				}
+				return backoff.Permanent(fmt.Errorf(
+					"uow: database %q not found — the schema is managed by beads-team-server; ask your operator to run 'bts init' first: %w",
+					database, err))
+			}
+			if err := checkTeamServerSchema(ctx, conn, database); err != nil {
+				if isSerializationError(err) {
+					return fmt.Errorf("uow: team-server schema check: %w", err)
+				}
+				return backoff.Permanent(err)
+			}
+			// Identity is checked only after the schema check proves the
+			// metadata table exists at this binary's version.
+			if err := checkTeamServerIdentity(ctx, conn, database, p.expectedProjectID); err != nil {
+				if isSerializationError(err) {
+					return fmt.Errorf("uow: team-server identity check: %w", err)
+				}
+				return backoff.Permanent(err)
+			}
+			return nil
+		}
 		if created {
 			// Re-assert on retries so a database dropped between attempts
 			// (e.g. a concurrent clean-databases) is recreated rather than
@@ -143,7 +177,7 @@ func (p *doltSQLProvider) initSchema(ctx context.Context, database string, creat
 			}
 			if !exists {
 				if !createIfMissing {
-					return backoff.Permanent(fmt.Errorf("uow: database %q not found on Dolt server; run 'bd init' to create it", database))
+					return backoff.Permanent(fmt.Errorf("uow: database %q not found on Dolt server; run 'bd init' to create a new database, or 'bd bootstrap' to restore an existing project", database))
 				}
 				switch err := ddl.CreateDatabase(ctx, database); {
 				case err == nil:
@@ -199,15 +233,17 @@ func openDB(ctx context.Context, dsn string) (*sql.DB, error) {
 	return conn, nil
 }
 
-func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUser, rootPassword, tlsConfigName string, createIfMissing bool) (UnitOfWorkProvider, error) {
+func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUser, rootPassword, tlsConfigName string, teamServer bool, expectedProjectID string, createIfMissing bool) (UnitOfWorkProvider, error) {
 	initDB, err := openDB(ctx, buildDSN(ep, "", rootUser, rootPassword, tlsConfigName))
 	if err != nil {
 		return nil, err
 	}
 
 	initProvider := &doltSQLProvider{
-		defaultBranch: defaultBranch,
-		db:            initDB,
+		defaultBranch:     defaultBranch,
+		db:                initDB,
+		teamServer:        teamServer,
+		expectedProjectID: expectedProjectID,
 	}
 
 	if err := initProvider.initSchema(ctx, database, createIfMissing); err != nil {
@@ -225,7 +261,9 @@ func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUse
 	}
 
 	return &doltSQLProvider{
-		defaultBranch: defaultBranch,
-		db:            dbConn,
+		defaultBranch:     defaultBranch,
+		db:                dbConn,
+		teamServer:        teamServer,
+		expectedProjectID: expectedProjectID,
 	}, nil
 }

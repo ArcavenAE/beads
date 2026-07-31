@@ -141,6 +141,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`bd dolt push` and `bd sync` no longer adopt a Dolt remote derived from
+  git origin without consent** (#5068). On a rig with no Dolt remote
+  configured, both commands silently derived one from `git remote get-url
+  origin`, added it, persisted `sync.remote` into `.beads/config.yaml`,
+  committed that config change under the user's git identity, and uploaded the
+  full issue history — no prompt, no flag, no opt-out. A public git origin
+  therefore published the whole issue database on a command the user believed
+  targeted an already-configured remote.
+
+  Adoption is now a consent decision and fails closed. Interactively, bd shows
+  the derived URL and every side effect that follows a yes (including the
+  config commit made under your git identity) and defaults to **no**.
+  Non-interactively it refuses and exits non-zero, naming the URL it would have
+  adopted and the explicit opt-in. `--yes`/`-y` consents ahead of time for
+  scripted use; `--no-adopt` or `BD_NO_REMOTE_ADOPT=1` disables adoption
+  entirely and wins over `--yes`. Rigs with a remote already configured are
+  unaffected — that path was and remains a no-op.
+
+  Workspace resolution also moved below the gate: it calls
+  `prepareSelectedNoDBContext`, which mutates workspace state, and nothing may
+  mutate before consent is established.
+
 - **Proxied-server CI shard 1 flake: `TestProxiedServerCleanDatabases` ran a
   server-global destructive command against the shared test container**
   (p1-9lf, hazard tracked in p1-8dz). The test used the shared external Dolt
@@ -338,6 +360,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wisps and embedded mode are unchanged. New metrics
   `bd.claim_verify_lost_total` and `bd.claim_verify_recovered_total` count
   loud failures and converted outcomes.
+
+## [1.1.2] - 2026-07-26
+
+Hotfix release cut from v1.1.0. (There is no 1.1.1 release: its tag was cut
+but the release pipeline's package gate failed on a stale MCP lockfile before
+publishing anything, and the version number was burned rather than moving the
+tag.) If `bd migrate` on 1.1.0 aborted with
+`rekey aux row ids: <table>: ... invalid hash length` and the database then
+refused to open, this release lets the migration complete.
+
+### Fixed
+
+- **The v53 aux row re-key survives dolt#11131 encoding drift.** On storage
+  affected by the upstream Dolt adaptive-encoding bug, reading the drifted
+  cells panics (`invalid hash length: 19`), which aborted the migration and
+  left the database unopenable under 1.1.0. The re-key now skips such a
+  table with a warning, records it in a clone-local drift record
+  (`aux_row_rekey_drifted` in `local_metadata`), and completes the
+  migration; recorded tables are retried on later migration passes and are
+  exempted from the changed-signature dirty-table guard so the retry cannot
+  re-brick the database
+  ([#4380](https://github.com/gastownhall/beads/issues/4380)).
 
 ## [1.1.0] - 2026-07-04
 

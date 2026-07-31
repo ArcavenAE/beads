@@ -8,6 +8,20 @@ import (
 
 var validIdentifier = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
+const maxIdentifierLength = 64
+
+// ValidateIdentifier checks whether name is safe to use, unquoted, as a
+// database or table identifier in this package's DDL statements.
+func ValidateIdentifier(name string) error {
+	if len(name) > maxIdentifierLength {
+		return fmt.Errorf("identifier too long: %q (max %d chars)", name, maxIdentifierLength)
+	}
+	if !validIdentifier.MatchString(name) {
+		return fmt.Errorf("invalid identifier: %q", name)
+	}
+	return nil
+}
+
 type DDLSQLRepository interface {
 	// DatabaseExists reports whether the named database is present on the
 	// server. It iterates SHOW DATABASES rather than using SHOW DATABASES LIKE
@@ -90,8 +104,8 @@ func (r *ddlSQLRepository) UseDatabase(ctx context.Context, database string) err
 }
 
 func quoteIdentifier(name string) (string, error) {
-	if !validIdentifier.MatchString(name) {
-		return "", fmt.Errorf("invalid identifier: %q", name)
+	if err := ValidateIdentifier(name); err != nil {
+		return "", err
 	}
 	return "`" + name + "`", nil
 }

@@ -590,6 +590,7 @@ func TestEmbeddedCreate(t *testing.T) {
 					"labels": ["x", "y"],
 					"metadata": {"str": "v", "num": 3},
 					"mol_type": "swarm",
+					"storage_class": "unversioned",
 					"pinned": true
 				},
 				{
@@ -653,6 +654,9 @@ func TestEmbeddedCreate(t *testing.T) {
 		}
 		if issue.MolType != types.MolType("swarm") {
 			t.Errorf("mol_type: got %q", issue.MolType)
+		}
+		if issue.StorageClass != types.StorageClassUnversioned {
+			t.Errorf("storage_class: got %q, want unversioned", issue.StorageClass)
 		}
 		if !issue.Pinned {
 			t.Errorf("pinned not set")
@@ -999,9 +1003,11 @@ A new feature
 			t.Fatalf("label count = %d, want 2", labelCount)
 		}
 
+		// events is dolt_ignored since 0062 (bd-red8u): audit rows are durable
+		// in the working set, never at HEAD.
 		var labelEventCount int
 		if err := db.QueryRowContext(t.Context(),
-			"SELECT COUNT(*) FROM events AS OF 'HEAD' WHERE issue_id = ? AND event_type = ?",
+			"SELECT COUNT(*) FROM events WHERE issue_id = ? AND event_type = ?",
 			id, types.EventLabelAdded).Scan(&labelEventCount); err != nil {
 			t.Fatalf("count label events: %v", err)
 		}

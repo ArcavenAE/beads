@@ -63,6 +63,8 @@ func TestNewDoltServerUOWProvider_ValidationErrors(t *testing.T) {
 				tc.rootUser, "", tc.doltBin,
 				0,
 				0,
+				false,
+				"",
 			)
 			assert.Nil(t, p)
 			require.Error(t, err)
@@ -107,6 +109,9 @@ func TestNewDoltServerUOWProvider_HappyPath(t *testing.T) {
 		bin,
 		0,
 		0,
+		false,
+		"",
+		WithCreateIfMissing(true),
 	)
 
 	require.NoError(t, err)
@@ -163,6 +168,9 @@ func TestNewDoltServerUOWProvider_ConcurrentInstantiation(t *testing.T) {
 				bin,
 				0,
 				0,
+				false,
+				"",
+				WithCreateIfMissing(true),
 			)
 			results[i] = result{provider: p, err: err}
 		}()
