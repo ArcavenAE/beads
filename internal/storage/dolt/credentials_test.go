@@ -2,13 +2,18 @@ package dolt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
+
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
@@ -626,6 +631,103 @@ func TestFederationPeerCredentialLifecycleLazyKeyInit(t *testing.T) {
 	if peers[0].Password != peer.Password {
 		t.Fatalf("ListFederationPeers()[0].Password = %q, want %q", peers[0].Password, peer.Password)
 	}
+}
+
+// A federation_peers row travels with the database; the credential key file
+// does not. A database opened on a second machine therefore holds a peer
+// password this machine's key cannot read, and both server-mode read paths
+// must say so with the remediation instead of surfacing a bare
+// "cipher: message authentication failed" (GH#5085 review). sqlmock stands in
+// for the server, following draincall_regression_test.go, so the branch is
+// pinned without a live Dolt.
+func TestFederationPeerDecryptKeyMismatchNamesTheLocalKey(t *testing.T) {
+	writerKey := make([]byte, 32)
+	for i := range writerKey {
+		writerKey[i] = byte(i)
+	}
+	localKey := make([]byte, 32)
+	for i := range localKey {
+		localKey[i] = byte(i + 1)
+	}
+
+	encrypted, err := encryptWithKey("peerpass", writerKey)
+	if err != nil {
+		t.Fatalf("encryptWithKey() error = %v", err)
+	}
+
+	// credentialKey is preset, so ensureCredentialKey is a no-op and no test
+	// writes a key file.
+	newStore := func(t *testing.T) (*DoltStore, sqlmock.Sqlmock) {
+		t.Helper()
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock: %v", err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		return &DoltStore{db: db, credentialKey: localKey}, mock
+	}
+
+	peerRows := func() *sqlmock.Rows {
+		now := time.Now()
+		return sqlmock.NewRows([]string{
+			"name", "remote_url", "username", "password_encrypted",
+			"sovereignty", "last_sync", "created_at", "updated_at",
+		}).AddRow("team", "https://peer.example/peerdb", "peeruser", encrypted, "T2", nil, now, now)
+	}
+
+	wantFragments := []string{
+		// Both paths name the peer, so the operator knows which one to re-add.
+		"failed to decrypt password for peer team",
+		// The shared enrichment, pinned verbatim. The machine-local key file is
+		// context in a parenthetical, not an asserted cause: an AES-GCM open also
+		// fails on a tampered blob and on a row still under the legacy key, and
+		// re-adding the peer is the fix in all three cases.
+		"stored peer credentials cannot be decrypted with this machine's credential key " +
+			"(the key file " + credentialKeyFile + " is machine-local and does not replicate with the database); " +
+			"re-run 'bd federation add-peer <name> <url> --user <user>' on this machine",
+		// The cipher error stays wrapped, so the raw cause is still readable.
+		"cipher: message authentication failed",
+	}
+
+	assertMismatch := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("read succeeded, want decrypt failure")
+		}
+		if !errors.Is(err, storage.ErrCredentialKeyMismatch) {
+			t.Errorf("error = %v, want errors.Is storage.ErrCredentialKeyMismatch", err)
+		}
+		for _, want := range wantFragments {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not mention %q", err, want)
+			}
+		}
+	}
+
+	t.Run("GetFederationPeer", func(t *testing.T) {
+		store, mock := newStore(t)
+		mock.ExpectQuery(regexp.QuoteMeta("FROM federation_peers WHERE name = ?")).
+			WithArgs("team").
+			WillReturnRows(peerRows())
+
+		_, err := store.GetFederationPeer(t.Context(), "team")
+		assertMismatch(t, err)
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet sqlmock expectations: %v", err)
+		}
+	})
+
+	t.Run("ListFederationPeers", func(t *testing.T) {
+		store, mock := newStore(t)
+		mock.ExpectQuery(regexp.QuoteMeta("FROM federation_peers ORDER BY name")).
+			WillReturnRows(peerRows())
+
+		_, err := store.ListFederationPeers(t.Context())
+		assertMismatch(t, err)
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("unmet sqlmock expectations: %v", err)
+		}
+	})
 }
 
 // openCloudAuthTestStore opens a DoltStore against the shared test Dolt server

@@ -100,7 +100,13 @@ func (s *EmbeddedDoltStore) decryptPassword(encrypted []byte) (string, error) {
 	nonce, ciphertext := encrypted[:nonceSize], encrypted[nonceSize:]
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return "", err
+		// The common shape: the peer row replicated with the database but the key
+		// file did not, so machine B pulls the row, ensureCredentialKey generates
+		// a fresh key, and every decrypt fails authentication. Enrich at the
+		// single decrypt funnel so every reader reports it: peer resolution for
+		// the remote verbs, GetFederationPeer, ListFederationPeers. The wording
+		// is shared with package dolt, which enriches its own two read paths.
+		return "", storage.CredentialKeyMismatchError(credentialKeyFile, err)
 	}
 	return string(plaintext), nil
 }
@@ -141,7 +147,7 @@ func (s *EmbeddedDoltStore) GetFederationPeer(ctx context.Context, name string) 
 	if len(row.EncryptedPwd) > 0 {
 		row.Peer.Password, err = s.decryptPassword(row.EncryptedPwd)
 		if err != nil {
-			return nil, fmt.Errorf("decrypt password: %w", err)
+			return nil, fmt.Errorf("decrypt password for peer %s: %w", name, err)
 		}
 	}
 	return &row.Peer, nil

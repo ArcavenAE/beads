@@ -347,7 +347,12 @@ func (s *DoltStore) GetFederationPeer(ctx context.Context, name string) (*storag
 		}
 		peer.Password, err = s.decryptPassword(encryptedPwd)
 		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt password: %w", err)
+			// federation_peers rows travel with the database, the key file does
+			// not, so a database opened on a second machine reaches here with a
+			// key that cannot read the stored password. Name the peer, then hand
+			// off to the shared wording package embeddeddolt also uses.
+			return nil, fmt.Errorf("failed to decrypt password for peer %s: %w", name,
+				storage.CredentialKeyMismatchError(credentialKeyFile, err))
 		}
 	}
 
@@ -390,7 +395,10 @@ func (s *DoltStore) ListFederationPeers(ctx context.Context) ([]*storage.Federat
 			}
 			peer.Password, err = s.decryptPassword(encryptedPwd)
 			if err != nil {
-				return nil, fmt.Errorf("failed to decrypt password: %w", err)
+				// Same enrichment as GetFederationPeer: a list must not report a
+				// local key problem as a bare cipher error either.
+				return nil, fmt.Errorf("failed to decrypt password for peer %s: %w", peer.Name,
+					storage.CredentialKeyMismatchError(credentialKeyFile, err))
 			}
 		}
 
