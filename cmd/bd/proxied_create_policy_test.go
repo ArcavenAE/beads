@@ -27,7 +27,7 @@ import (
 type capturedProxiedOpen struct {
 	databaseOverride string
 	posture          identityPosture
-	opts             []uow.UOWProviderOption
+	opts             []uow.ProviderOption
 }
 
 var errProxiedPolicySentinel = errors.New("proxied create-policy test: open intercepted")
@@ -39,7 +39,7 @@ func interceptProxiedOpens(t *testing.T) *[]capturedProxiedOpen {
 	t.Helper()
 	var captured []capturedProxiedOpen
 	orig := openProxiedServerUOWProviderFn
-	openProxiedServerUOWProviderFn = func(ctx context.Context, beadsDir, databaseOverride string, posture identityPosture, opts ...uow.UOWProviderOption) (uow.UnitOfWorkProvider, error) {
+	openProxiedServerUOWProviderFn = func(ctx context.Context, beadsDir, databaseOverride string, posture identityPosture, opts ...uow.ProviderOption) (uow.UnitOfWorkProvider, error) {
 		captured = append(captured, capturedProxiedOpen{
 			databaseOverride: databaseOverride,
 			posture:          posture,

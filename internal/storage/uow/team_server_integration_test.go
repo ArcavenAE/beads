@@ -52,7 +52,7 @@ func newTeamServerHarness(t *testing.T) *teamServerHarness {
 	}
 }
 
-func (h *teamServerHarness) openProvider(ctx context.Context, database string, teamServer bool, expectedProjectID string, opts ...UOWProviderOption) (UnitOfWorkProvider, error) {
+func (h *teamServerHarness) openProvider(ctx context.Context, database string, teamServer bool, expectedProjectID string, opts ...ProviderOption) (UnitOfWorkProvider, error) {
 	return NewExternalDoltServerUOWProvider(
 		ctx,
 		h.storeRootDir,

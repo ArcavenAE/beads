@@ -27,7 +27,7 @@ func NewDoltServerUOWProvider(
 	idleTimeout time.Duration,
 	teamServer bool,
 	expectedProjectID string,
-	opts ...UOWProviderOption,
+	opts ...ProviderOption,
 ) (UnitOfWorkProvider, error) {
 	if idleTimeout == 0 {
 		idleTimeout = defaultProxyIdleTimeout
@@ -71,5 +71,5 @@ func NewDoltServerUOWProvider(
 		return nil, fmt.Errorf("uow: get proxy endpoint: %w", err)
 	}
 
-	return openAndInitSchema(ctx, ep, database, rootUser, rootPassword, "", teamServer, expectedProjectID, newUOWProviderOptions(opts))
+	return openAndInitSchema(ctx, ep, database, rootUser, rootPassword, "", teamServer, expectedProjectID, applyProviderOptions(opts))
 }
