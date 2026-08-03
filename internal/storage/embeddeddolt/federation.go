@@ -171,16 +171,27 @@ var federationEnvMutex sync.Mutex
 // stored by add-peer win and override the environment pair as a unit, so an
 // ambient DOLT_REMOTE_PASSWORD never mixes with a stored username (or vice
 // versa); remotes without a stored peer keep the environment fallback.
+//
+// Every callback path holds federationEnvMutex, including the environment
+// fallbacks: the in-process Dolt engine reads the pair from the process
+// environment, so an unserialized plain-remote operation could observe
+// another peer operation's temporarily installed credentials.
+//
+// Stored credentials are bound to the peer's canonical remote URL, not only
+// to its name (see verifyPeerRemoteURL).
 func (s *EmbeddedDoltStore) withPeerAuth(ctx context.Context, peer string, fn func(user string) error) error {
 	p, err := s.GetFederationPeer(ctx, peer)
-	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			return fn(remoteAuthUser())
-		}
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return fmt.Errorf("resolve peer credentials: %w", err)
 	}
-	if p.Username == "" && p.Password == "" {
+	if err != nil || (p.Username == "" && p.Password == "") {
+		federationEnvMutex.Lock()
+		defer federationEnvMutex.Unlock()
 		return fn(remoteAuthUser())
+	}
+
+	if err := s.verifyPeerRemoteURL(ctx, peer, p.RemoteURL); err != nil {
+		return err
 	}
 
 	federationEnvMutex.Lock()
@@ -194,6 +205,30 @@ func (s *EmbeddedDoltStore) withPeerAuth(ctx context.Context, peer string, fn fu
 	}()
 
 	return fn(p.Username)
+}
+
+// verifyPeerRemoteURL fails closed when the live remote named peer does not
+// carry the URL stored on the federation peer row. AddRemoteIfNotExists
+// preserves an existing same-name remote regardless of its URL, so the name
+// alone does not prove the destination; installing the stored password for a
+// diverged URL would disclose it to an unrelated host. A missing remote fails
+// the same way: there is no verified destination to authenticate against.
+// Runs before any credential is installed, outside federationEnvMutex.
+func (s *EmbeddedDoltStore) verifyPeerRemoteURL(ctx context.Context, peer, storedURL string) error {
+	var liveURL string
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, "SELECT url FROM dolt_remotes WHERE name = ?", peer).Scan(&liveURL)
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("federation peer %s has stored credentials but no remote named %s exists; re-run 'bd federation add-peer %s <url> --user <user>' to restore it", peer, peer, peer)
+	}
+	if err != nil {
+		return fmt.Errorf("resolve remote URL for peer %s: %w", peer, err)
+	}
+	if liveURL != storedURL {
+		return fmt.Errorf("remote %s points at %q but federation peer %s stored its credentials for %q; refusing to send stored credentials to a diverged URL. Remove and re-add the peer to rebind it", peer, liveURL, peer, storedURL)
+	}
+	return nil
 }
 
 // overrideEnv sets key to value (unsetting it when value is empty, so an
