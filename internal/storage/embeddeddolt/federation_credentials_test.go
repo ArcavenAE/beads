@@ -270,6 +270,28 @@ func TestDecryptPassword_KeyMismatchNamesTheLocalKey(t *testing.T) {
 	})
 }
 
+// Pins the short-ciphertext branch (GH#5214 review): a stored blob shorter
+// than the GCM nonce is local corruption of the credential row, so it must
+// classify through the same sentinel as a failed authentication rather than
+// surface as a bare cipher error that federation status reads as an
+// unreachable peer.
+func TestDecryptPassword_ShortCiphertextClassifiesAsKeyMismatch(t *testing.T) {
+	store := newPeerAuthTestStore(t)
+
+	_, err := store.decryptPassword([]byte("short"))
+	if err == nil {
+		t.Fatal("decryptPassword succeeded, want short-ciphertext failure")
+	}
+	if !errors.Is(err, storage.ErrCredentialKeyMismatch) {
+		t.Errorf("error = %v, want errors.Is storage.ErrCredentialKeyMismatch", err)
+	}
+	for _, want := range []string{wantKeyMismatchClause, "ciphertext too short"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
 // A remote verb keeps failing closed on an undecryptable password: the
 // operation must not run under ambient credentials, which could present the
 // wrong identity to the peer.

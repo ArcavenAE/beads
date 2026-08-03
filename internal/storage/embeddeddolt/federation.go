@@ -95,7 +95,12 @@ func (s *EmbeddedDoltStore) decryptPassword(encrypted []byte) (string, error) {
 	}
 	nonceSize := gcm.NonceSize()
 	if len(encrypted) < nonceSize {
-		return "", fmt.Errorf("ciphertext too short")
+		// A blob too short to carry its nonce is the same local-corruption
+		// class as the failed GCM open below: the stored credential cannot be
+		// decrypted on this machine, and re-adding the peer is the fix.
+		// Classify it through the same sentinel so federation status reports
+		// the credential problem rather than an unreachable peer.
+		return "", storage.CredentialKeyMismatchError(credentialKeyFile, fmt.Errorf("ciphertext too short"))
 	}
 	nonce, ciphertext := encrypted[:nonceSize], encrypted[nonceSize:]
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
