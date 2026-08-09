@@ -258,7 +258,7 @@ func (s *DoltStore) decryptPassword(encrypted []byte) (string, error) {
 	if key == nil {
 		// Deliberately not a key mismatch: the key was never initialized on
 		// this store, so the fix is init or file permissions, not re-adding
-		// the peer. Labelling it a mismatch would prescribe the wrong action.
+		// the peer. Labeling it a mismatch would prescribe the wrong action.
 		return "", fmt.Errorf("credential encryption key not initialized")
 	}
 	plaintext, err := decryptWithKey(encrypted, key)

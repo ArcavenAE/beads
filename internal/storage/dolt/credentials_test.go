@@ -1103,7 +1103,7 @@ func TestEnvPrefixesForRemoteURL(t *testing.T) {
 // An uninitialized credential key is not a key mismatch, and the distinction
 // is reachable from the peer readers: initCredentialKey returns nil without
 // setting a key when beadsDir is empty, so ensureCredentialKey succeeds and
-// decryptPassword still finds no key. Wrapping at the callers labelled that
+// decryptPassword still finds no key. Wrapping at the callers labeled that
 // error a mismatch and told the operator to re-add the peer, which does
 // nothing when the key was never created; the fix there is init or file
 // permissions. The wrap therefore lives at the decrypt funnel instead.
