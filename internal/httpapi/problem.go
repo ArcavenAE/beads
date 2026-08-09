@@ -16,6 +16,7 @@ import (
 	"github.com/steveyegge/beads/internal/httpapi/apigen"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/uow"
+	"github.com/steveyegge/beads/issueops"
 )
 
 // Every non-2xx byte this server emits is an RFC 9457 problem+json document
@@ -58,6 +59,29 @@ const (
 	// sentinel's message text.
 	CodeAlreadyClaimed Code = "already_claimed"
 	CodeNotClaimable   Code = "not_claimable"
+	// CodeNotClosable is close policy refusing an unforced close: open
+	// children, or a live blocker. The open-children refusal carries the count
+	// in the `open_children` extension member, read inside the refusing
+	// transaction — never parsed out of the sentinel's message text — and its
+	// PRESENCE is how a client tells the two refusals apart without prose.
+	//
+	// A 409 rather than the delete precedent's 400: this is a statement about
+	// the current state of one named resource, so the same request succeeds or
+	// fails on state the client cannot see without reading it. That is the
+	// not_claimable situation and it gets the not_claimable answer.
+	CodeNotClosable Code = "not_closable"
+	// CodeDependencyCycle covers BOTH never-makes-progress refusals a requested
+	// edge set can earn: a scheduling cycle, and a blocking edge against the
+	// issue's own ancestor or descendant. They are one code because they have
+	// one client recovery — rethink the edge, with no force bypass for either —
+	// and codes are the vocabulary of recovery. The typed distinction is NOT
+	// lost: the hierarchy refusal additionally carries `issue_id`, `blocker_id`
+	// and `blocker_is_ancestor`, read inside the refusing transaction, and
+	// member presence is the discriminator.
+	CodeDependencyCycle Code = "dependency_cycle"
+	// CodeDependencyExists is the pair that already carries an edge of a
+	// DIFFERENT type, with both types in `existing_type`/`requested_type`.
+	CodeDependencyExists Code = "dependency_exists"
 	// CodeBusy is retryable contention: the transaction retry budget was
 	// exhausted, or the in-flight request limit was saturated.
 	CodeBusy Code = "busy"
@@ -77,14 +101,17 @@ const codeClientClosed Code = "client_closed"
 // codeStatus freezes one HTTP status per code. A code that could arrive with
 // two different statuses would defeat the point of dispatching on it.
 var codeStatus = map[Code]int{
-	CodeInvalidArgument: http.StatusBadRequest,
-	CodeInvalidCursor:   http.StatusBadRequest,
-	CodeNotFound:        http.StatusNotFound,
-	CodeAlreadyClaimed:  http.StatusConflict,
-	CodeNotClaimable:    http.StatusConflict,
-	CodeBusy:            http.StatusServiceUnavailable,
-	CodeDBUnavailable:   http.StatusServiceUnavailable,
-	CodeInternal:        http.StatusInternalServerError,
+	CodeInvalidArgument:  http.StatusBadRequest,
+	CodeInvalidCursor:    http.StatusBadRequest,
+	CodeNotFound:         http.StatusNotFound,
+	CodeAlreadyClaimed:   http.StatusConflict,
+	CodeNotClaimable:     http.StatusConflict,
+	CodeNotClosable:      http.StatusConflict,
+	CodeDependencyCycle:  http.StatusConflict,
+	CodeDependencyExists: http.StatusConflict,
+	CodeBusy:             http.StatusServiceUnavailable,
+	CodeDBUnavailable:    http.StatusServiceUnavailable,
+	CodeInternal:         http.StatusInternalServerError,
 }
 
 // Status returns the HTTP status frozen to c, or 0 if c is not in the v0
@@ -143,13 +170,28 @@ var ErrBusy = errors.New("server busy")
 
 // Operation ids, matching the spec's operationId values exactly.
 const (
-	OpHealth               = "health"
-	OpGetContext           = "getContext"
-	OpListReadyWork        = "listReadyWork"
-	OpGetStats             = "getStats"
-	OpListIssues           = "listIssues"
-	OpGetIssue             = "getIssue"
-	OpClaimIssue           = "claimIssue"
+	OpHealth        = "health"
+	OpGetContext    = "getContext"
+	OpListReadyWork = "listReadyWork"
+	OpGetStats      = "getStats"
+	OpListIssues    = "listIssues"
+	OpGetIssue      = "getIssue"
+	OpClaimIssue    = "claimIssue"
+	// OpCloseIssue is the second half of the agent loop this surface exists to
+	// serve: claim, work, close. It is a named lifecycle action rather than a
+	// status patch because Close carries semantics a patch has nowhere to put —
+	// the reason and session under first-close-wins, the done-status
+	// normalization, and the close policy vocabulary.
+	OpCloseIssue = "closeIssue"
+	// OpReopenIssue is the close's mirror, and it completes the lifecycle pair
+	// so a recovery flow works end to end over this surface. It is the one
+	// write here with no conflict code: reopen has no policy guard.
+	OpReopenIssue = "reopenIssue"
+	// OpUpdateIssue edits the FIELDS of one issue. Lifecycle is deliberately not
+	// among them: status belongs to close/reopen/claim, which carry the policy
+	// and conflict vocabulary, and assignee belongs to the claim's
+	// compare-and-set. Keeping both out is why this operation has no 409.
+	OpUpdateIssue          = "updateIssue"
 	OpListSettings         = "listSettings"
 	OpGetSetting           = "getSetting"
 	OpListDependencyCycles = "listDependencyCycles"
@@ -171,6 +213,15 @@ const (
 	OpGetDependencyTree = "getDependencyTree"
 	OpCountReadyWork    = "countReadyWork"
 	OpQueryIssues       = "queryIssues"
+	// OpRemoveDependency is the first WRITE to the dependency graph on this
+	// surface, behind issueops.DependencyEditor. It names one edge by both its
+	// endpoints, because an edge has two and neither alone identifies it.
+	OpRemoveDependency = "removeDependency"
+	// OpAddDependencies is the graph's other write: a BATCH of edges asserted
+	// as one transaction, or none of them. It is the operation that owns both
+	// new conflict codes, because both are statements about the graph a
+	// requested edge set would produce.
+	OpAddDependencies = "addDependencies"
 	// OpSweepIssues is one of the two DESTRUCTIVE operations on this surface:
 	// bulk clearance of closed beads from one tier, behind issueops.Sweeper.
 	OpSweepIssues = "sweepIssues"
@@ -225,7 +276,11 @@ var operationCodes = map[string][]Code{
 	OpGetContext:    {CodeInternal},
 	OpListReadyWork: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
 	OpListIssues:    {CodeInvalidArgument, CodeInvalidCursor, CodeBusy, CodeDBUnavailable, CodeInternal},
-	OpGetIssue:      {CodeNotFound, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// The 400 is this operation's own, the getStats precedent: a malformed
+	// `include_comments` or `include_dependents` is a bad value on a parameter
+	// this server knows, not the document-level unknown-key rule this table
+	// omits.
+	OpGetIssue: {CodeInvalidArgument, CodeNotFound, CodeBusy, CodeDBUnavailable, CodeInternal},
 	// No 400 of its own: the operation takes no parameters, so the only
 	// invalid_argument it can raise is the document-level unknown-query-key
 	// rule this table deliberately omits.
@@ -279,6 +334,33 @@ var operationCodes = map[string][]Code{
 		CodeInvalidArgument, CodeNotFound, CodeAlreadyClaimed, CodeNotClaimable,
 		CodeBusy, CodeDBUnavailable, CodeInternal,
 	},
+	// The 409 is close POLICY, and it is the only conflict this operation has:
+	// an unforced close refused for open children or for a live blocker. There
+	// is no already_claimed here — closing work somebody else holds is not a
+	// refusal on this surface — and the idempotent re-close is a 200 carrying
+	// `already_closed`, the claim's answer to the same question.
+	OpCloseIssue: {
+		CodeInvalidArgument, CodeNotFound, CodeNotClosable,
+		CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
+	// NO 409, and the absence is the point. Close has a policy guard — open
+	// children, a live blocker — and reopen is the direction that takes an issue
+	// OUT of the done category rather than putting it in, so there is no state
+	// of the graph that can refuse it and nothing to name. The idempotent case
+	// is a 200 carrying `already_open`, not a conflict.
+	OpReopenIssue: {
+		CodeInvalidArgument, CodeNotFound,
+		CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
+	// No conflict code, and the excluded members are exactly where one would
+	// have entered: `status` would drag in close policy, `assignee` the claim
+	// fence, `parent_id` the graph vocabulary. The 400 is the body vocabulary
+	// plus the ROLE's ErrValidation — a workspace-vocabulary issue_type, a
+	// field-length refusal that slipped the edge check — through failUpdate.
+	OpUpdateIssue: {
+		CodeInvalidArgument, CodeNotFound,
+		CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
 	// No not_found. The role refuses an edge whose target names nothing, and
 	// that refusal is about the REQUEST BODY the client sent, not about a
 	// resource this operation was asked to address — there is no id in the path
@@ -312,6 +394,29 @@ var operationCodes = map[string][]Code{
 	// one of its values. No 404 — a search matching nothing is an empty page,
 	// because a question about a set has an answer even when the set is empty.
 	OpListMemories: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// NO 404, for a stronger version of the batch create's reason: an edge that
+	// is not there is `removed: false`, and an endpoint id that names nothing
+	// holds no edge either, so this operation probes no id's existence and has
+	// nothing it could report a miss on — listBlockingAnnotations' argument,
+	// applied to a write. No conflict code either: the removal is idempotent, so
+	// another caller having got there first is a success rather than a collision.
+	OpRemoveDependency: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// The two conflict codes are this operation's alone, and both say the same
+	// kind of thing: the request is fine as a request and the GRAPH refuses it,
+	// which the caller cannot know without reading state it does not have. That
+	// is the claim's not_claimable situation and it gets the claim's answer, a
+	// typed 409 whose extension members are read inside the refusing
+	// transaction. The delete's 400-for-a-graph-refusal precedent does not
+	// apply: that one is about request COMPLETENESS — send cascade or force —
+	// and neither of these has a force to send.
+	//
+	// No 404: an endpoint that names nothing is a refusal of the request BODY,
+	// so it joins the 400 with every other body refusal (batchCreateIssues'
+	// argument). Nothing was written in any of these cases.
+	OpAddDependencies: {
+		CodeInvalidArgument, CodeDependencyCycle, CodeDependencyExists,
+		CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
 }
 
 // Result is a problem response ready to be written: the envelope plus the
@@ -334,6 +439,49 @@ func (r Result) WithAssignee(assignee string) Result {
 // status at the moment of refusal). Same rule as WithAssignee.
 func (r Result) WithIssueStatus(status string) Result {
 	r.Problem.IssueStatus = &status
+	return r
+}
+
+// WithOpenChildren attaches the `open_children` extension member (how many open
+// children the transaction that refused a close observed). Same rule as
+// WithAssignee: it comes from the typed error's own field, read inside that
+// transaction, never from parsing the refusal's prose.
+//
+// Its PRESENCE is load-bearing. It is attached for the open-children refusal
+// and withheld for the live-blocker one, which is how a client tells the two
+// apart without reading `detail`.
+func (r Result) WithOpenChildren(n int) Result {
+	r.Problem.OpenChildren = &n
+	return r
+}
+
+// WithDependencyTypeConflict attaches the two `dependency_exists` extension
+// members: the type the pair already carries and the type the request asked
+// for. Populate them from *issueops.DependencyTypeConflictError's fields — the
+// typed error the role raises inside the transaction that saw the stored edge —
+// never by parsing its message.
+func (r Result) WithDependencyTypeConflict(existing, requested string) Result {
+	r.Problem.ExistingType = &existing
+	r.Problem.RequestedType = &requested
+	return r
+}
+
+// WithHierarchyConflict attaches the three extension members that distinguish
+// the HIERARCHY refusal from a plain scheduling cycle inside the one
+// `dependency_cycle` code. Their PRESENCE is the discriminator, and the three
+// together are enough to rebuild
+// *issueops.DependencyHierarchyConflictError whole — BlockerIsAncestor in both
+// polarities included, which is why the boolean travels through a pointer and
+// is emitted when false.
+//
+// They can only come from the refusing transaction, for the reason
+// ClaimConflictError's do and more so: the conflicting hierarchy may exist only
+// inside the batch that was rolled back, so no read after the fact can recover
+// it.
+func (r Result) WithHierarchyConflict(issueID, blockerID string, blockerIsAncestor bool) Result {
+	r.Problem.IssueId = &issueID
+	r.Problem.BlockerId = &blockerID
+	r.Problem.BlockerIsAncestor = &blockerIsAncestor
 	return r
 }
 
@@ -437,6 +585,17 @@ func ClassifyError(err error) Result {
 
 	case errors.Is(err, storage.ErrNotClaimable):
 		return newResult(CodeNotClaimable, "issue is not in a claimable state")
+
+	// The two close-policy refusals share one code. They are the same statement
+	// to a client — the close was refused for the state of the graph around
+	// this issue, and `force` is the bypass for both — and what distinguishes
+	// them on the wire is the `open_children` member failClose attaches, not a
+	// second vocabulary entry.
+	case errors.Is(err, issueops.ErrCloseOpenChildren):
+		return newResult(CodeNotClosable, "issue has open children; close them first or close with force")
+
+	case errors.Is(err, issueops.ErrCloseBlocked):
+		return newResult(CodeNotClosable, "issue is blocked; clear the blocker or close with force")
 
 	case errors.Is(err, ErrBusy):
 		res := newResult(CodeBusy, "")

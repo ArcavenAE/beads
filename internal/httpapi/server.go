@@ -170,8 +170,14 @@ type Config struct {
 	// one reason — so the units of work they open land in that request's uow_ms
 	// (see Server.reader) — and a role reached this way opens none through this
 	// server, so a rebuild would buy nothing.
-	Reader            issueops.Reader
-	Claimer           issueops.Claimer
+	Reader  issueops.Reader
+	Claimer issueops.Claimer
+	// Lifecycle is the guarded-mutation role behind the issue lifecycle
+	// operations. Required on the same terms as every field here, and the
+	// hook-firing refusal below bites hardest on it: a store's own
+	// IssueLifecycle() returns a role that fires on_create, on_update and the
+	// close hooks for every mutation it lands.
+	Lifecycle         issueops.Lifecycle
 	Settings          issueops.WorkspaceConfig
 	Stats             issueops.StatsReporter
 	CycleDetector     issueops.CycleDetector
@@ -188,6 +194,11 @@ type Config struct {
 	// Deleter is the OTHER destructive one, required for the same reason.
 	Deleter      issueops.Deleter
 	BatchCreator issueops.BatchCreator
+	// DependencyEditor is the graph's write side. Required on the same terms as
+	// the two destructive roles above: whether this build can rewire the
+	// dependency graph is a decision for the operator who chose to run bd serve,
+	// not a consequence of whether a caller remembered a field.
+	DependencyEditor issueops.DependencyEditor
 	// Memories is the workspace's persistent memory plane, and the one field
 	// here that is not an issueops role: memories are user data riding in the
 	// config table under their own merge class, not settings, so they have
@@ -224,6 +235,7 @@ type Server struct {
 	// names because a struct cannot carry both.
 	issueReader       issueops.Reader
 	issueClaimer      issueops.Claimer
+	issueLifecycle    issueops.Lifecycle
 	settings          issueops.WorkspaceConfig
 	issueStats        issueops.StatsReporter
 	issueCycles       issueops.CycleDetector
@@ -235,6 +247,7 @@ type Server struct {
 	issueSweeper      issueops.Sweeper
 	issueDeleter      issueops.Deleter
 	issueBatchCreator issueops.BatchCreator
+	issueDependencies issueops.DependencyEditor
 	workspaceMemories memoryops.Memories
 
 	listener net.Listener
@@ -334,6 +347,7 @@ func Listen(cfg Config) (*Server, error) {
 		provider:          cfg.Provider,
 		issueReader:       cfg.Reader,
 		issueClaimer:      cfg.Claimer,
+		issueLifecycle:    cfg.Lifecycle,
 		settings:          cfg.Settings,
 		issueStats:        cfg.Stats,
 		issueCycles:       cfg.CycleDetector,
@@ -345,6 +359,7 @@ func Listen(cfg Config) (*Server, error) {
 		issueSweeper:      cfg.Sweeper,
 		issueDeleter:      cfg.Deleter,
 		issueBatchCreator: cfg.BatchCreator,
+		issueDependencies: cfg.DependencyEditor,
 		workspaceMemories: cfg.Memories,
 
 		sem:        make(chan struct{}, maxInflight),
@@ -435,12 +450,12 @@ func Listen(cfg Config) (*Server, error) {
 // actually sets; a typed nil stored in one of these fields is a value as far as
 // this check is concerned.
 func sourceRoles(cfg Config) []any {
-	return []any{cfg.Reader, cfg.Claimer, cfg.Settings, cfg.Stats, cfg.CycleDetector, cfg.EdgeReader, cfg.BlockingAnnotator, cfg.TreeWalker, cfg.ReadyCounter, cfg.Querier, cfg.Sweeper, cfg.Deleter, cfg.BatchCreator, cfg.Memories}
+	return []any{cfg.Reader, cfg.Claimer, cfg.Lifecycle, cfg.Settings, cfg.Stats, cfg.CycleDetector, cfg.EdgeReader, cfg.BlockingAnnotator, cfg.TreeWalker, cfg.ReadyCounter, cfg.Querier, cfg.Sweeper, cfg.Deleter, cfg.BatchCreator, cfg.DependencyEditor, cfg.Memories}
 }
 
 // roleSourceNames spells sourceRoles for the refusal message, in the same
 // order, so a caller reading the error learns the whole set it must pass.
-const roleSourceNames = "Reader, Claimer, Settings, Stats, CycleDetector, EdgeReader, BlockingAnnotator, TreeWalker, ReadyCounter, Querier, Sweeper, Deleter, BatchCreator and Memories"
+const roleSourceNames = "Reader, Claimer, Lifecycle, Settings, Stats, CycleDetector, EdgeReader, BlockingAnnotator, TreeWalker, ReadyCounter, Querier, Sweeper, Deleter, BatchCreator, DependencyEditor and Memories"
 
 func anyRoleSet(cfg Config) bool {
 	return slices.ContainsFunc(sourceRoles(cfg), func(r any) bool { return r != nil })
@@ -464,6 +479,13 @@ func checkDatabaseSource(cfg Config) error {
 		return errors.New("httpapi: a configured role fires this workspace's hooks; " +
 			"this server does not run hooks, so take the roles from the store beneath the hook decorator " +
 			"((*storage.HookFiringStore).Unwrap)")
+	case uow.ProviderFiresHooks(cfg.Provider):
+		// The same refusal for the other database source. A provider's roles
+		// carry whatever the provider carries, so a hook-firing one would run a
+		// user's subprocess per served mutation just as a hook-firing role does.
+		return errors.New("httpapi: the configured provider fires this workspace's hooks; " +
+			"this server does not run hooks, so pass the provider beneath the hook layer " +
+			"(uow.UnwrapProvider)")
 	}
 	return nil
 }
@@ -616,6 +638,25 @@ func (s *Server) claimer(r *http.Request) (issueops.Claimer, error) {
 	return checkedClaimer{inner: cl}, nil
 }
 
+// lifecycle returns the guarded issue-mutation surface for one request.
+//
+// Built the same two ways as claimer above and for the same reasons: the
+// configured role on the roles source, and on the provider source one built per
+// request so its units of work are timed into THIS request's log line, held by
+// INTERFACE so uow.IssueLifecycleSource is load-bearing rather than decorative
+// — and, from either source, wrapped in checkedLifecycle.
+func (s *Server) lifecycle(r *http.Request) (issueops.Lifecycle, error) {
+	if s.provider == nil {
+		return checkedLifecycle{inner: s.issueLifecycle}, nil
+	}
+	var src uow.IssueLifecycleSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
+	lc, err := src.IssueLifecycle()
+	if err != nil {
+		return nil, err
+	}
+	return checkedLifecycle{inner: lc}, nil
+}
+
 // workspaceConfig returns the guarded workspace-settings surface for one
 // request.
 //
@@ -755,6 +796,25 @@ func (s *Server) batchCreator(r *http.Request) (issueops.BatchCreator, error) {
 	return checkedBatchCreator{inner: creator}, nil
 }
 
+// dependencyEditor returns the guarded dependency-graph write surface for one
+// request, on the same terms as every role above and held by INTERFACE so
+// uow.DependencyEditorSource is load-bearing rather than decorative.
+//
+// It goes out UNWRAPPED, like the sweeper and the deleter: both of this role's
+// results are VALUES, so no handler dereferences a pointer it returned.
+//
+// The role this returns owns every refusal the graph can raise — the cycle
+// gate, the hierarchy rule, the type conflict and the endpoint existence checks
+// — which is why the Config field it comes from is required rather than
+// optional.
+func (s *Server) dependencyEditor(r *http.Request) (issueops.DependencyEditor, error) {
+	if s.provider == nil {
+		return s.issueDependencies, nil
+	}
+	var src uow.DependencyEditorSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
+	return src.DependencyEditor()
+}
+
 // memories returns the persistent-memory surface for one request, on the same
 // terms as every role above and held by INTERFACE so uow.MemoriesSource is
 // load-bearing rather than decorative.
@@ -864,8 +924,24 @@ func orDefault(v, fallback time.Duration) time.Duration {
 // middleware in front of both.
 func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
+	// Rows carrying a customMethod SHARE a pattern, so they get one
+	// registration between them and a dispatcher in front. Collected in table
+	// order, which is the order customMethodTarget tries the suffixes in.
+	shared := map[string][]route{}
+	var sharedOrder []string
 	for _, rt := range routeTable {
-		mux.Handle(rt.method+" "+rt.pattern, s.route(rt))
+		if rt.customMethod == "" {
+			mux.Handle(rt.method+" "+rt.pattern, s.route(rt))
+			continue
+		}
+		key := rt.method + " " + rt.pattern
+		if _, seen := shared[key]; !seen {
+			sharedOrder = append(sharedOrder, key)
+		}
+		shared[key] = append(shared[key], rt)
+	}
+	for _, key := range sharedOrder {
+		mux.Handle(key, s.dispatchCustomMethod(shared[key]))
 	}
 
 	// Not an operation and deliberately not in the route table: it exists so
@@ -1043,6 +1119,29 @@ func (s *Server) checkHost(next http.Handler) http.Handler {
 			return
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+// dispatchCustomMethod is the one registration the single-resource custom
+// methods share. It splits the trailing `:verb` off the matched segment, hands
+// the request to the row that claims it, and leaves the id where that row's
+// handler reads it.
+//
+// The split happens BEFORE s.route, which is what makes an unrouted suffix cost
+// nothing: it takes no database slot and books no operation on the request
+// line, exactly as the catch-all's 404 does. Answering it from inside a row's
+// handler — where the claim answered it while it was the only POST here — would
+// attribute every probe of this prefix to whichever operation happened to be
+// first in the table.
+func (s *Server) dispatchCustomMethod(rows []route) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rt, id, res := customMethodTarget(rows, r.PathValue(customMethodPathValue))
+		if res != nil {
+			s.fail(w, r, *res)
+			return
+		}
+		r.SetPathValue(customMethodIDValue, id)
+		s.route(rt).ServeHTTP(w, r)
 	})
 }
 

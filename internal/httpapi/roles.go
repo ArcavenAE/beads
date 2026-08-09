@@ -91,6 +91,59 @@ func (c checkedBatchCreator) CreateBatch(ctx context.Context, req issueops.Creat
 	return result, nil
 }
 
+// checkedLifecycle is the lifecycle role every mutation handler is handed.
+//
+// Update, Close and Reopen are why it exists: all three handlers write
+// *result.Issue, which is checkedClaimer's hazard exactly. Create passes
+// through because no handler on this surface reaches it — a single create is
+// unpublished here, and batchCreateIssues goes to issueops.BatchCreator.
+type checkedLifecycle struct{ inner issueops.Lifecycle }
+
+// Create passes the request through unchanged: this surface publishes no
+// create-one operation (batchCreateIssues reaches issueops.BatchCreator).
+func (c checkedLifecycle) Create(ctx context.Context, req issueops.CreateRequest) (issueops.CreateResult, error) {
+	return c.inner.Create(ctx, req)
+}
+
+// Update refuses a result that reports success without the row the response
+// body is built from, for Close's reason.
+func (c checkedLifecycle) Update(ctx context.Context, req issueops.UpdateRequest) (issueops.UpdateResult, error) {
+	result, err := c.inner.Update(ctx, req)
+	if err == nil && result.Issue == nil {
+		return issueops.UpdateResult{}, fmt.Errorf("update %q: the lifecycle reported success without an issue", req.IssueID)
+	}
+	return result, err
+}
+
+// Close refuses a result that reports success without the row the response body
+// is built from.
+//
+// There is no wire code for it and there must not be one: `already_closed` says
+// the issue was closed earlier and the response still carries the row, and a
+// 404 would tell a client the issue does not exist when nothing here knows
+// that. It is a broken implementation, so it is the generic 500 — with the
+// fault in the log as an error and a request_error line beside it, which is
+// what the panic it replaces did not produce.
+func (c checkedLifecycle) Close(ctx context.Context, req issueops.CloseRequest) (issueops.CloseResult, error) {
+	result, err := c.inner.Close(ctx, req)
+	if err == nil && result.Issue == nil {
+		return issueops.CloseResult{}, fmt.Errorf("close %q: the lifecycle reported success without an issue", req.IssueID)
+	}
+	return result, err
+}
+
+// Reopen refuses a result that reports success without the row the response
+// body is built from, for Close's reason: handleReopen dereferences it, and a
+// broken implementation should be the generic 500 with the fault in the log
+// rather than a panic on a live server.
+func (c checkedLifecycle) Reopen(ctx context.Context, req issueops.ReopenRequest) (issueops.ReopenResult, error) {
+	result, err := c.inner.Reopen(ctx, req)
+	if err == nil && result.Issue == nil {
+		return issueops.ReopenResult{}, fmt.Errorf("reopen %q: the lifecycle reported success without an issue", req.IssueID)
+	}
+	return result, err
+}
+
 // checkedClaimer is the claimer the claim handler is handed.
 type checkedClaimer struct{ inner issueops.Claimer }
 

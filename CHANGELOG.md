@@ -7,6 +7,170 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A durable events journal, and `bd events` to read it** (bd-opisf). External
+  tooling that wants to stay in step with a workspace had two options and
+  neither was a feed: a fire-and-forget script hook that may not run, or polling
+  whole snapshots and diffing them — which still misses anything that changed
+  twice between two reads. The journal is the third. Every committed issue
+  mutation writes one ordered record, in the same transaction as the mutation
+  itself, and a consumer replays those records from a checkpoint it can resume.
+  Each record carries the operation, the mutated id, and the issue's full
+  post-mutation snapshot (including `is_blocked`), so a mirror stays correct
+  without re-querying the graph.
+
+  **It is off by default and opt-in per workspace**: `bd config set
+  events-journal true`, or `BD_EVENTS_JOURNAL=1`. Nothing is recorded while it
+  is off, so a workspace that never enables it pays nothing.
+
+  **On means bounded.** Two retention floors define the window every consumer
+  is guaranteed — `events-journal-retain-days` (default 7) and
+  `events-journal-retain-rows` (default 100000), each disabled by setting it to
+  0 — and beads enforces them for you: after a mutating command commits, and on
+  a timer inside `bd serve`, it deletes the prefix the floors do not protect.
+  The pass is throttled by a persisted watermark (about one an hour per
+  workspace — or sooner after a large burst of writes), runs in its own
+  transactions outside the mutation's, is capped at a few batches so a long
+  backlog drains over several commands rather than stalling one, and can never
+  fail a command — a failure is logged and skipped. It maintains the workspace
+  whose command triggered it, so a workspace only ever written remotely (a
+  routed `bd create --repo`) relies on commands run in it, or on its own `bd
+  serve`. Setting both floors to 0 keeps every record forever;
+  `events-journal-auto-prune false` keeps the floors but leaves deletion to you.
+  All four are `config.yaml` keys with `BD_EVENTS_JOURNAL*` environment
+  equivalents.
+
+  `bd events tail --since <seq>` prints records as JSON lines and `--follow`
+  keeps printing them as writes commit; `bd events export` prints the journal
+  from the beginning; `bd events prune --before <seq>` takes an earlier,
+  on-demand cut below the floors — it cannot cut deeper than they allow, so
+  shrinking the retained window means lowering them. The floors are a
+  recent-window guarantee, not a consumer watermark: size them for the longest
+  outage a consumer must survive.
+
+  **A read that cannot resume fails instead of lying.** When `--since` falls
+  below the oldest retained record, the read neither skips ahead to the
+  surviving suffix nor returns an empty success: both are silent record loss
+  that a cursor cannot detect. It exits 1 with a typed
+  `events_journal_truncated` error carrying `since`, `floor` and `head`, so a
+  consumer can choose between resuming at `floor - 1` with a known gap and
+  re-baselining. Under `--json` that is the error payload; mid-`--follow` it is
+  one compact JSON object on a line of the JSONL stream it interrupts, because
+  the consumer on the other end is a line reader. An interior gap — which
+  nothing in bd can produce, since a prune only ever removes a prefix — refuses
+  the same way.
+
+  The journal is clone-local working-set state (`dolt_ignore`d): never
+  versioned, never pushed or federated, per branch, and per replica — each
+  clone counts its own seq space, so a checkpoint from one replica is
+  meaningless against another. `bd dolt pull` and merge-settled changes, raw
+  `bd sql` DML, store-open migrations, and compaction rewrites are not
+  journaled. The record contract and every boundary are documented in
+  [docs/reference/events-journal.md](docs/reference/events-journal.md).
+
+- **`is_blocked` is a documented optional member of the /v0 OpenAPI issue
+  schemas** (bd-opisf) — `Issue`, `IssueWithCounts`, `IssueDetails`,
+  `IssueWithDependencyMetadata` and `TreeNode`, the five welded to the
+  canonical Go struct. It is the persisted readiness projection: true when an
+  open blocking dependency keeps an issue out of the ready set, derived from
+  the dependency graph and maintained by the server, never set by a client. It
+  is omitted when false, so absence means false. Journal snapshots are what set
+  it; readiness itself is computed exactly as before.
+
+- **`bd serve` grows the write half of the agent loop** (v0 wire surface,
+  [#5410](https://github.com/gastownhall/beads/pull/5410),
+  [#5417](https://github.com/gastownhall/beads/pull/5417),
+  [#5422](https://github.com/gastownhall/beads/pull/5422),
+  [#5423](https://github.com/gastownhall/beads/pull/5423),
+  [#5429](https://github.com/gastownhall/beads/pull/5429)). v0 shipped with one
+  mutation, the claim, which meant an HTTP client could take work and had to
+  fork a `bd` subprocess to finish it. Five operations close that loop:
+
+  - `POST /v0/beads/issues/{id}:close` and `POST /v0/beads/issues/{id}:reopen`
+    — the two halves of the lifecycle move. Both are idempotent, and both say
+    so in the body rather than in a status: a close of a closed issue answers
+    `200` with `already_closed: true`, a reopen of an open one
+    `already_open: true`, and each still carries the row.
+  - `PATCH /v0/beads/issues/{id}` — partial update of one issue. The `patch`
+    object publishes thirteen members; four of them (`estimated_minutes`,
+    `external_ref`, `due_at`, `defer_until`) are nullable, and an explicit
+    `null` CLEARS them. That set is closed and machine-checked against the
+    document, so a `null` on any other member is a `400` rather than an
+    unannounced clear. A patch that changes nothing answers `200` with
+    `changed: false`.
+  - `POST /v0/beads/dependencies:add` — up to 100 edges per request, asserted
+    all or none, echoed back in request order. A refusal names the offending
+    edge as `edges[i].member`, so a client learns which edge and which member
+    rather than that something in the batch was wrong.
+  - `POST /v0/beads/dependencies:remove` — removes exactly the edge the body
+    names. Idempotent at the role: an edge that is not there is
+    `removed: false` with a `200`, never a 404, so a replayed teardown does not
+    have to classify an error to discover it already ran.
+
+  **Every one of them carries the claim's posture, unchanged.** The `actor` is
+  caller-asserted provenance for the audit trail and not authenticated
+  identity; hooks do not fire; the per-command auto-commit machinery does not
+  run. The only durable effect is the single storage commit the role makes
+  inside its own transaction, so durability is per request on every write, not
+  just the claim.
+
+  **Three codes join the frozen error vocabulary**, all 409 and all typed so a
+  client never has to substring-match a message. `not_closable` is close policy
+  refusing an unforced close of an issue with open children or a live blocker.
+  `dependency_exists` is the pair that already carries an edge of a DIFFERENT
+  type, and carries `existing_type` and `requested_type`. `dependency_cycle`
+  covers both never-makes-progress refusals: the plain scheduling cycle, and a
+  blocking edge against the issue's own ancestor or descendant — the second
+  carries `issue_id`, `blocker_id` and `blocker_is_ancestor`, and their ABSENCE
+  is what tells a client which of the two it got. Every extension member is
+  read off the refusing transaction's own typed error; the hierarchy members
+  have no other source, since the conflicting edge may exist only inside the
+  batch that was rolled back. An edge naming an endpoint this database can see
+  the absence of is a `400` on `edges[i].issue_id` or `edges[i].depends_on_id`,
+  not a 404: the request BODY is what is wrong, and there is no path id to have
+  missed.
+
+  **`GET /v0/beads/issues/{id}` takes two new parameters.**
+  `include_comments` populates `comments` with the full comment bodies and
+  `include_dependents` populates `dependents` with the issues that depend on
+  this one, each carrying its edge type. Both default to false, because both
+  are extra reads nobody should pay for by accident — and when a caller does
+  not ask, `comment_count`, `dependent_count` and `comments_omitted` still
+  report what was left out, so an absent `comments` is never ambiguous between
+  "no comments" and "not included in this response". A malformed boolean is
+  this operation's own `400 invalid_argument` / `reason: "invalid_value"`,
+  which is deliberately not the `unknown_parameter` a client should read as
+  version skew.
+
+  `GET /v0/beads/context` advertises `issues.close`, `issues.reopen`,
+  `issues.update`, `dependencies.add` and `dependencies.remove` alongside the
+  rest — derived from the registered handlers as always, so probing
+  `capabilities` remains the way to ask one server what it can do.
+
+- **The two dependency-endpoint refusals now carry an identity** (bd-yby99.9).
+  `DependencyEditor.AddDependencies` refuses an edge whose SOURCE names no row,
+  and one whose TARGET names no row this database can see the absence of. Both
+  were "an error" and nothing more — not the same error text on every backend,
+  and impossible to tell apart from an infrastructure failure — which left the
+  role's typed-refusal vocabulary with a hole every other refusal it can raise
+  had already filled. They are now `errors.Is`-matchable as
+  `ErrDependencySourceNotFound` and `ErrDependencyTargetNotFound`, carried by a
+  `*DependencyEndpointNotFoundError` naming the refused edge and which of its
+  endpoints was absent, all three re-exported from the root package beside the
+  conflict types. What is NOT refused is unchanged: an `external:` reference
+  and another repository's id are still accepted as external targets.
+
+  The user-facing message is byte-identical on the embedded and store paths
+  (`issue <id> not found`), and the proxied-server path now renders that
+  message too instead of a raw foreign-key violation — the endpoint is
+  classified from the refusing transaction rather than parsed out of the
+  driver's prose, so the two plumbings agree on the text as well as the type.
+  The shared `DependencyEditor` contract asserts the sentinel and the typed
+  fields for each endpoint, alone in a request and mid-batch, with the
+  mid-batch half reading the graph back at zero edges. `RemoveDependency` is
+  unaffected: a removal that finds no edge is a success, not a refusal.
+
 ### Changed
 
 - **`bd search` now includes closed issues by default** (bd-t5yex). The
@@ -26,6 +190,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exclusion default with opt-in `--all`; only `bd search` changed.
 
 ### Fixed
+
+- **Script hooks now fire on both write plumbings** (bd-opisf). bd has two write
+  plumbings and only one of them ran the workspace's hook scripts. The
+  DoltStorage decorator chain fires `on_create`/`on_update`/`on_close` after
+  every mutation it lands; the unit-of-work plumbing — the one **proxied-server
+  mode** writes through — fired nothing from the plumbing, so an integration
+  wired to `.beads/hooks/` silently missed every mutation that went through it.
+  Four commands (`update`, `close`, `reopen`, `gate`) had grown hand-wired hook
+  calls of their own to paper over the gap; every other write — `create`, batch
+  create and close, claim, `comment`, label edits, dependency edits — ran no
+  hook at all. A notifying wrapper now fires them from the plumbing, buffered
+  during the transaction and drained only after the commit succeeds, so a
+  rolled-back or retried write reports nothing.
+
+  Six changes are visible in proxied mode, and all six move it toward what the
+  embedded path has always done (a seventh, below, applies to both):
+
+  - **One firing site per plumbing.** The four per-command hook calls are gone.
+  - **`bd update -s closed` fires `on_update` only.** It used to fire `on_close`
+    as well. `bd close` is what fires `on_close`, on both plumbings.
+  - **`bd close` no longer fires an `on_update` ahead of its `on_close`.**
+  - **Hooks run fire-and-forget, after the write commits**, rather than
+    synchronously inside the command.
+  - **`no-hooks` is honored.** The per-command calls ignored it, so hooks fired
+    in proxied mode even when they were switched off.
+  - **An idempotent re-close fires `on_close`**, and a double `bd gate resolve`
+    fires it too. The per-command calls suppressed both; the embedded path has
+    always fired for a close that succeeded, changed row or not, so a script
+    reconciling on "it is closed" is told every time rather than only the first.
+
+  And one change every workspace sees, embedded and proxied alike: **a command
+  now waits for its own fire-and-forget hooks before exiting**, bounded by the
+  per-hook timeout (10s). Both plumbings run hook scripts on background
+  goroutines, and a short command could return from `main` before one had even
+  started — a hook that silently never fired. The wait happens after the store
+  closes, so a hook script's own `bd` can open the workspace, and it runs on the
+  error exit paths too, so a partial batch still delivers the hook for what it
+  did commit. A command that fires no hooks waits on nothing.
+
+  `bd serve` still runs no hooks, and `bd import` still fires none on either
+  plumbing (both import through the batch-upsert engine rather than the
+  per-issue verbs).
 
 - **`--dolt-auto-commit batch`/`off` now actually defer version commits in
   SQL-server mode** (bd-4wamg). The mode was silently inert there: the CLI's

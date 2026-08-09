@@ -124,6 +124,27 @@ func (e ListReadyWorkParamsSort) Valid() bool {
 	}
 }
 
+// AddDependenciesRequest defines model for AddDependenciesRequest.
+type AddDependenciesRequest struct {
+	// Actor Who is asserting the edges, under `ClaimRequest.actor`'s rules and for the same reasons: the server trims it, refuses an empty result, anything longer than 256 BYTES, and any control character including newline. It is attributed on each `dependency_added` event a genuinely new edge records, and interpolated into the storage commit message.
+	Actor string `json:"actor"`
+
+	// Edges The edges to assert, in the caller's order. An empty array is a `400` rather than a successful no-op: a write request that writes nothing is a client bug, and answering it cheerfully is how a client whose own list filtered to nothing silently stops wiring anything.
+	//
+	// The 100-edge cap is a bound on how long one request may hold a write transaction, not a statement about batch semantics. Split a larger graph; each request is atomic on its own — but note that splitting it changes what the cycle gate can see, since the gate runs over one request at a time.
+	//
+	// A per-edge refusal names its offender as `edges[i].member`.
+	Edges []DependencyEdge `json:"edges"`
+}
+
+// AddDependenciesResponse defines model for AddDependenciesResponse.
+type AddDependenciesResponse struct {
+	// Added The request's edges, in REQUEST ORDER. It echoes the request because all-or-nothing means it is either every edge or the call failed, so a caller reporting what landed reads the result and never has to know which of the two it is safe to read. An idempotent same-type re-add is echoed like any other edge; the response does not say which edges were genuinely new, because nothing a client does depends on that.
+	//
+	// Never null and never shorter than the request: a partial outcome does not exist on this operation.
+	Added []DependencyEdge `json:"added"`
+}
+
 // BatchCreateDependency defines model for BatchCreateDependency.
 type BatchCreateDependency struct {
 	// TargetId The far end of the edge: an issue this workspace holds, an item created earlier in the same request, an `external:` reference, or an id whose prefix belongs to another repository. Anything else is a `400` and nothing is created.
@@ -184,7 +205,9 @@ type BondRef = types.BondRef
 
 // ClaimRequest defines model for ClaimRequest.
 type ClaimRequest struct {
-	// Actor Who is claiming the issue. The server trims it, then refuses an empty result, anything longer than 256 BYTES (the `maxLength` above counts characters — the byte limit is the binding one), and any control character including newline. The value is persisted as the assignee and interpolated into the storage commit message, so an unvalidated newline would forge audit-trail lines.
+	// Actor Who is claiming the issue. The server trims it, then refuses an empty result, anything longer than 256 BYTES (the `maxLength` above counts characters — the byte limit is the binding one), and any control character including newline: Unicode category Cc — C0, DEL and the C1 block — plus the U+2028/U+2029 line separators, which is the set the `pattern` above spells.
+	//
+	// The value is persisted as the assignee and interpolated into the storage commit message, so an unvalidated newline would forge audit-trail lines. C1 is refused for that same reason and not for tidiness: U+0085 is a line break on a VT-conformant terminal, and U+009B is the one-byte CSI introducer, which would make an actor an escape-sequence payload in anything that prints an assignee.
 	Actor string `json:"actor"`
 }
 
@@ -195,6 +218,33 @@ type ClaimResponse struct {
 
 	// Issue A tracked work item. Property semantics documented here apply to every schema that repeats them below.
 	Issue Issue `json:"issue"`
+}
+
+// CloseIssueRequest defines model for CloseIssueRequest.
+type CloseIssueRequest struct {
+	// Actor Who is closing the issue. `ClaimRequest.actor`'s rules exactly: the server trims it, then refuses an empty result, anything longer than 256 BYTES (the `maxLength` above counts characters — the byte limit is the binding one), and any control character including newline. The value reaches stored columns, event-stream attribution and the storage commit message, so an unvalidated newline would forge audit-trail lines.
+	Actor string `json:"actor"`
+
+	// Force Bypass close policy — the open-children refusal and the live-blocker refusal — and nothing else. The refusals are the ROLE's, so this endpoint cannot skip a guard by forgetting one exists. A forced close still reports `open_children`.
+	Force *bool `json:"force,omitempty"`
+
+	// Reason Why the issue is closed. Stored on the issue and read back as `close_reason`. THE FIRST CLOSE WINS: an idempotent re-close writes neither this nor `session`, so a replayed close cannot rewrite the record of why the work ended. Refused for control characters, and bounded by what the column holds rather than by the number above.
+	Reason *string `json:"reason,omitempty"`
+
+	// Session The working session that closed the issue, stored and read back as `closed_by_session`, under the same first-close-wins rule and the same bounds as `reason`.
+	Session *string `json:"session,omitempty"`
+}
+
+// CloseIssueResponse defines model for CloseIssueResponse.
+type CloseIssueResponse struct {
+	// AlreadyClosed True when the issue was already closed and this call changed nothing — the idempotent re-close, mirroring `ClaimResponse.already_claimed`. The response still carries the row, and `reason`/`session` were not rewritten.
+	AlreadyClosed bool `json:"already_closed"`
+
+	// Issue A tracked work item. Property semantics documented here apply to every schema that repeats them below.
+	Issue Issue `json:"issue"`
+
+	// OpenChildren How many open children the close observed. Reported by a FORCED close — including an idempotent re-close — because a caller that bypassed the guard is exactly the caller that wants the number. An unforced close that got this far had none, so it reports 0.
+	OpenChildren int `json:"open_children"`
 }
 
 // Comment defines model for Comment.
@@ -214,7 +264,7 @@ type ContextResponse struct {
 	// BeadsDir Absolute path of the served workspace's `.beads` directory. A host path, kept because it is the single-workspace server's only workspace-identity handshake; disclosing it to network peers is part of what an operator accepts when binding beyond loopback.
 	BeadsDir string `json:"beads_dir"`
 
-	// Capabilities The operations this server actually implements, derived from its route table. v0's vocabulary is `ready.list`, `ready.count`, `issues.list`, `issues.query`, `issues.get`, `issues.claim`, `issues.sweep`, `issues.delete`, `issues.batchCreate`, `stats.get`, `config.list`, `config.get`, `dependencies.cycles`, `dependencies.list`, `dependencies.blocking`, `dependencies.tree`, `memories.list`, `memories.get`, `memories.remember`, `memories.forget`; it grows additively, and an operation never appears here unless it is fully implemented. This is how a client checks for an operation — never the version string.
+	// Capabilities The operations this server actually implements, derived from its route table. v0's vocabulary is `ready.list`, `ready.count`, `issues.list`, `issues.query`, `issues.get`, `issues.claim`, `issues.close`, `issues.reopen`, `issues.update`, `issues.sweep`, `issues.delete`, `issues.batchCreate`, `stats.get`, `config.list`, `config.get`, `dependencies.cycles`, `dependencies.list`, `dependencies.blocking`, `dependencies.tree`, `dependencies.add`, `dependencies.remove`, `memories.list`, `memories.get`, `memories.remember`, `memories.forget`; it grows additively, and an operation never appears here unless it is fully implemented. This is how a client checks for an operation — never the version string.
 	Capabilities []string `json:"capabilities"`
 
 	// Database Logical database name (not a host or a DSN).
@@ -309,6 +359,18 @@ type DeleteIssuesResult struct {
 // Dependency A dependency edge between two issues.
 type Dependency = types.Dependency
 
+// DependencyEdge One directed edge, as a REQUEST names it. It is not `Dependency`, which is the stored row `GET /v0/beads/dependencies` returns and carries the columns storage assigned; this is the three members a caller supplies.
+type DependencyEdge struct {
+	// DependsOnId The edge's TARGET — the issue depended upon. An exact canonical id, an `external:` reference, or an id belonging to another repository. Only an absence this database can SEE is refused. It must differ from `issue_id`.
+	DependsOnId string `json:"depends_on_id"`
+
+	// IssueId The edge's SOURCE — the issue that depends on the other end. An EXACT canonical id, and one this database holds: an edge follows its source, so a source that names nothing is a `400`.
+	IssueId string `json:"issue_id"`
+
+	// Type The edge type, from the same OPEN vocabulary `Dependency.type` carries: checked for being a storable value, never for membership of a known-types list, so a workspace's own type passes.
+	Type string `json:"type"`
+}
+
 // DependencyEdges The stored edges of the named issues, plus the ids that named nothing. It is NOT a page: this operation has no limit and no cursor, because the number of issues asked about is what bounds it.
 type DependencyEdges struct {
 	// Items Every matching edge, flattened across the named issues rather than keyed by source — the same flat array `bd dep list a b c --json` emits, so the two surfaces are one compatibility domain. Group by `issue_id` to recover the per-source view. Empty array (never null) when nothing matches.
@@ -351,6 +413,43 @@ type IssueBlocking = issueops.IssueBlocking
 
 // IssueDetails An `Issue` with its labels, dependency edges and cardinalities — the body of `GET /v0/beads/issues/{id}`. `dependencies` and `dependents` carry FULL issue objects plus the edge type, not bare edges. Property semantics are documented on `Issue`.
 type IssueDetails = types.IssueDetails
+
+// IssuePatchBody The fields to write. Every member is optional and PRESENCE is the signal: a member present is written, a member absent is untouched. An empty object is a `400` — a write that writes nothing is a client bug.
+//
+// This is a deliberate SUBSET of the fields an issue carries; the members it does not spell are future surface rather than oversights, and `updateIssue`'s own description says which and why.
+type IssuePatchBody struct {
+	AcceptanceCriteria *string `json:"acceptance_criteria,omitempty"`
+
+	// AppendNotes Appends to the notes rather than replacing them. Mutually exclusive with `notes`.
+	AppendNotes *string `json:"append_notes,omitempty"`
+
+	// DeferUntil RFC 3339. Explicit `null` CLEARS the deferral.
+	DeferUntil  *time.Time `json:"defer_until,omitempty"`
+	Description *string    `json:"description,omitempty"`
+	Design      *string    `json:"design,omitempty"`
+
+	// DueAt RFC 3339. Explicit `null` CLEARS the due date.
+	DueAt *time.Time `json:"due_at,omitempty"`
+
+	// EstimatedMinutes Explicit `null` CLEARS the estimate.
+	EstimatedMinutes *int `json:"estimated_minutes,omitempty"`
+
+	// ExternalRef Explicit `null` CLEARS the reference.
+	ExternalRef *string `json:"external_ref,omitempty"`
+
+	// IssueType The issue type, from this workspace's own configured vocabulary. A type outside it is refused by the ROLE and reaches the client as a `400` — this server cannot read the vocabulary without a transaction, so it checks only what this schema declares.
+	IssueType *string `json:"issue_type,omitempty"`
+
+	// Labels COMPLETE REPLACEMENT of the label set. An empty array clears every label. Incremental add/remove is deferred: replacement is the only shape whose result the client already knows without a read-back.
+	Labels *[]string `json:"labels,omitempty"`
+
+	// Notes Replaces the notes. Mutually exclusive with `append_notes`; sending both is a `400`.
+	Notes    *string `json:"notes,omitempty"`
+	Priority *int    `json:"priority,omitempty"`
+
+	// Title The issue's title. Must not be blank after trimming; the length bound is what the column holds.
+	Title *string `json:"title,omitempty"`
+}
 
 // IssueWithCounts An `Issue` plus relationship cardinalities. This is the element type of both `/v0/beads/ready` and `/v0/beads/issues`, matching what `bd ready --json` and `bd list --json` emit. Property semantics are documented on `Issue`.
 type IssueWithCounts = types.IssueWithCounts
@@ -401,14 +500,33 @@ type Problem struct {
 	// Assignee With `already_claimed`: the actor currently holding the issue.
 	Assignee *string `json:"assignee,omitempty"`
 
-	// Code The stable machine-readable reason, and the ONLY member a client may dispatch on. v0's vocabulary: `invalid_argument` (400, also emitted by the Host-header middleware on any route), `invalid_cursor` (400), `not_found` (404), `already_claimed` (409), `not_claimable` (409), `busy` (503), `db_unavailable` (503), `internal` (500). Renaming or removing a status+code pair is a breaking change; ADDING one is not, so clients MUST default-branch on unknown values and fall back to the status class (unknown 4xx → client bug, fail loud; unknown 503 → retry per `Retry-After`; other unknown 5xx → server fault).
+	// BlockerId With `dependency_cycle`, hierarchy refusal only: the ancestor or descendant the edge named as blocker. See `issue_id`.
+	BlockerId *string `json:"blocker_id,omitempty"`
+
+	// BlockerIsAncestor With `dependency_cycle`, hierarchy refusal only: true when `blocker_id` is an ANCESTOR of `issue_id` (which cannot close until its descendants finish, so the gate would never clear), false when it is a DESCENDANT (blocked status cascades, so it would inherit the block and never close). Both polarities are reported; this member is never omitted to mean false. See `issue_id`.
+	BlockerIsAncestor *bool `json:"blocker_is_ancestor,omitempty"`
+
+	// Code The stable machine-readable reason, and the ONLY member a client may dispatch on. v0's vocabulary: `invalid_argument` (400, also emitted by the Host-header middleware on any route), `invalid_cursor` (400), `not_found` (404), `already_claimed` (409), `not_claimable` (409), `not_closable` (409), `dependency_cycle` (409), `dependency_exists` (409), `busy` (503), `db_unavailable` (503), `internal` (500). Renaming or removing a status+code pair is a breaking change; ADDING one is not, so clients MUST default-branch on unknown values and fall back to the status class (unknown 4xx → client bug, fail loud; unknown 503 → retry per `Retry-After`; other unknown 5xx → server fault).
 	Code string `json:"code"`
 
 	// Detail Optional prose, never load-bearing. For 5xx codes it is a FIXED string per code and carries nothing about the underlying failure: driver and dial errors routinely embed the DSN, database user and host:port, and this API supports binding beyond loopback. 4xx details reflect the caller's own input back and are specific.
 	Detail *string `json:"detail,omitempty"`
 
+	// ExistingType With `dependency_exists`: the type of the edge the pair already carries, read inside the refusing transaction.
+	ExistingType *string `json:"existing_type,omitempty"`
+
+	// IssueId With `dependency_cycle`, and ONLY on the hierarchy refusal: the issue the requested blocking edge would have gated. Its PRESENCE is the discriminator — absent means a plain scheduling cycle, present means the edge pointed at the issue's own ancestor or descendant.
+	//
+	// The conflicting hierarchy may exist only inside the rolled-back batch, so no read after the fact can recover it: the refusing transaction is the only place this member can come from.
+	IssueId *string `json:"issue_id,omitempty"`
+
 	// IssueStatus With `already_claimed` or `not_claimable`: the issue's status at the moment of refusal.
 	IssueStatus *string `json:"issue_status,omitempty"`
+
+	// OpenChildren With `not_closable`: how many open children the transaction that refused the close observed, read inside that transaction rather than parsed out of `detail`.
+	//
+	// PRESENT ONLY for the open-children refusal. The other `not_closable` refusal is a live blocker and carries no such member, so member presence — not prose — is how a client tells the two apart. Both are bypassed by `force`.
+	OpenChildren *int `json:"open_children,omitempty"`
 
 	// Param With `invalid_argument`: the offending query parameter, body member or header name. Present on every 400 except a body that fails to parse at all.
 	Param *string `json:"param,omitempty"`
@@ -418,6 +536,9 @@ type Problem struct {
 
 	// RequestId Opaque correlation id for this request, echoed in the server's request log line. Never a dispatch key and never a retry key. (This server mints per-process ids that do not survive a restart; a deployment may substitute any identifier with the same log-correlation property, such as an edge trace id.)
 	RequestId string `json:"request_id"`
+
+	// RequestedType With `dependency_exists`: the type the request asked for. Together with `existing_type` it is the whole refusal, so a client never parses either out of `detail`.
+	RequestedType *string `json:"requested_type,omitempty"`
 
 	// Status The HTTP status code, repeated in the body.
 	Status int `json:"status"`
@@ -482,6 +603,42 @@ type RememberedMemory struct {
 
 	// Value The stored content, echoed verbatim. Always present, and never withheld — this plane has no redaction; see the operation description.
 	Value string `json:"value"`
+}
+
+// RemoveDependencyRequest defines model for RemoveDependencyRequest.
+type RemoveDependencyRequest struct {
+	// Actor Who is removing the edge, under `ClaimRequest.actor`'s rules and for the same reasons: the server trims it, refuses an empty result, anything longer than 256 BYTES, and any control character including newline. It is attributed on the `dependency_removed` event a real removal records, and interpolated into the storage commit message.
+	Actor string `json:"actor"`
+
+	// DependsOnId The edge's TARGET — the issue depended upon. An exact canonical id, under `issue_id`'s rule.
+	DependsOnId string `json:"depends_on_id"`
+
+	// IssueId The edge's SOURCE — the issue that depends on the other end. An EXACT canonical id: there is no fuzzy, prefix or substring resolution on this surface.
+	IssueId string `json:"issue_id"`
+}
+
+// RemoveDependencyResponse defines model for RemoveDependencyResponse.
+type RemoveDependencyResponse struct {
+	// Removed True when an edge was there and is now gone. FALSE IS A SUCCESS, not a refusal: it says this pair carried no such edge, which is the same graph a second removal leaves. Nothing was written for it.
+	Removed bool `json:"removed"`
+}
+
+// ReopenIssueRequest defines model for ReopenIssueRequest.
+type ReopenIssueRequest struct {
+	// Actor Who is reopening the issue. `ClaimRequest.actor`'s rules exactly: the server trims it, then refuses an empty result, anything longer than 256 BYTES (the `maxLength` above counts characters — the byte limit is the binding one), and any control character including newline. The value reaches the `reopened` event's attribution and the storage commit message, so an unvalidated newline would forge audit-trail lines.
+	Actor string `json:"actor"`
+
+	// Reason Why the issue is being reopened. Recorded on the `reopened` EVENT this move records — not on a field of the issue, and not carried in the response, so a caller that wants it back reads the issue's events. Refused for control characters, and bounded by what the column holds rather than by the number above.
+	Reason *string `json:"reason,omitempty"`
+}
+
+// ReopenIssueResponse defines model for ReopenIssueResponse.
+type ReopenIssueResponse struct {
+	// AlreadyOpen True when the issue was not in a done status and this call changed nothing — idempotent, mirroring `CloseIssueResponse.already_closed` and `ClaimResponse.already_claimed`. The response still carries the row.
+	AlreadyOpen bool `json:"already_open"`
+
+	// Issue A tracked work item. Property semantics documented here apply to every schema that repeats them below.
+	Issue Issue `json:"issue"`
 }
 
 // Setting One entry of the workspace's stored settings plane.
@@ -615,6 +772,26 @@ type SweepSkips struct {
 //
 // The tree is FLAT. A node's place in it is read from `depth` and `parent_id`, not from nesting, and a subtree is contiguous in `items`.
 type TreeNode = types.TreeNode
+
+// UpdateIssueRequest defines model for UpdateIssueRequest.
+type UpdateIssueRequest struct {
+	// Actor Who is editing the issue. `ClaimRequest.actor`'s rules exactly: the server trims it, then refuses an empty result, anything longer than 256 BYTES (the `maxLength` above counts characters — the byte limit is the binding one), and any control character including newline. The value reaches the history entry's attribution and the storage commit message, so an unvalidated newline would forge audit-trail lines.
+	Actor string `json:"actor"`
+
+	// Patch The fields to write. Every member is optional and PRESENCE is the signal: a member present is written, a member absent is untouched. An empty object is a `400` — a write that writes nothing is a client bug.
+	//
+	// This is a deliberate SUBSET of the fields an issue carries; the members it does not spell are future surface rather than oversights, and `updateIssue`'s own description says which and why.
+	Patch IssuePatchBody `json:"patch"`
+}
+
+// UpdateIssueResponse defines model for UpdateIssueResponse.
+type UpdateIssueResponse struct {
+	// Changed Whether the request persisted a semantic mutation. A same-value patch is a 200 with `changed: false` rather than an error — idempotent, like every replay answer on this surface.
+	Changed bool `json:"changed"`
+
+	// Issue A tracked work item. Property semantics documented here apply to every schema that repeats them below.
+	Issue Issue `json:"issue"`
+}
 
 // IssueID defines model for IssueID.
 type IssueID = string
@@ -754,6 +931,15 @@ type ListIssuesParams struct {
 	//
 	// One exception, and it is mode-dependent: when the server was started with `--allow-non-loopback`, `limit=0` is refused with 400 `invalid_argument`, `param: "limit"`, `reason: "invalid_value"` and detail "unlimited reads are loopback-only; pass an explicit limit". An unlimited read buffers the whole active set and its JSON encoding inside one shared process, which must not be reachable by arbitrary network peers. The bind mode is deliberately NOT advertised in `ContextResponse` — a client that wants an unlimited read asks for one and, on that 400, re-issues with an explicit limit (and pages with `cursor`); it is a client-side fix, never a retry.
 	Limit *int `form:"limit,omitempty" json:"limit,omitempty"`
+}
+
+// GetIssueParams defines parameters for GetIssue.
+type GetIssueParams struct {
+	// IncludeComments Populate `comments` with the issue's full comment bodies. When it is honored `comments_omitted` is false, so a client is never left to guess whether an absent list means "no comments" or "not asked for".
+	IncludeComments *bool `form:"include_comments,omitempty" json:"include_comments,omitempty"`
+
+	// IncludeDependents Populate `dependents` with the issues that depend on this one, each carrying its edge type — the shape `dependencies` already carries. Default false, for `include_comments`'s reason.
+	IncludeDependents *bool `form:"include_dependents,omitempty" json:"include_dependents,omitempty"`
 }
 
 // QueryIssuesParams defines parameters for QueryIssues.
@@ -923,8 +1109,23 @@ type GetStatsParams struct {
 	SkipBlocked *bool `form:"skip_blocked,omitempty" json:"skip_blocked,omitempty"`
 }
 
+// AddDependenciesJSONRequestBody defines body for AddDependencies for application/json ContentType.
+type AddDependenciesJSONRequestBody = AddDependenciesRequest
+
+// RemoveDependencyJSONRequestBody defines body for RemoveDependency for application/json ContentType.
+type RemoveDependencyJSONRequestBody = RemoveDependencyRequest
+
+// UpdateIssueJSONRequestBody defines body for UpdateIssue for application/json ContentType.
+type UpdateIssueJSONRequestBody = UpdateIssueRequest
+
 // ClaimIssueJSONRequestBody defines body for ClaimIssue for application/json ContentType.
 type ClaimIssueJSONRequestBody = ClaimRequest
+
+// CloseIssueJSONRequestBody defines body for CloseIssue for application/json ContentType.
+type CloseIssueJSONRequestBody = CloseIssueRequest
+
+// ReopenIssueJSONRequestBody defines body for ReopenIssue for application/json ContentType.
+type ReopenIssueJSONRequestBody = ReopenIssueRequest
 
 // BatchCreateIssuesJSONRequestBody defines body for BatchCreateIssues for application/json ContentType.
 type BatchCreateIssuesJSONRequestBody = BatchCreateRequest

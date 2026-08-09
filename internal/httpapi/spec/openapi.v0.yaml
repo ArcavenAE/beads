@@ -44,7 +44,7 @@ info:
     one error shape on this surface.
 
 
-    ## Two 400s apply to every route, and are documented here once
+    ## Three 400s cut across operations, and are documented here once
 
 
     * **Host header.** A request whose `Host` header is not in the server's
@@ -56,16 +56,34 @@ info:
       `reason: "unknown_parameter"` and `param` naming the offending key.
       Operations with no parameters at all (`GET /healthz`,
       `GET /v0/beads/context`, `GET /v0/beads/dependencies/cycles`,
-      `GET /v0/beads/issues/{id}`, `POST /v0/beads/issues/{id}:claim`,
-      `POST /v0/beads/issues:sweep`, `POST /v0/beads/issues:delete`,
-      `GET /v0/beads/config`,
-      `GET /v0/beads/config/{key}`) reject every query key the same way.
+      `POST /v0/beads/issues/{id}:claim`,
+      `POST /v0/beads/issues/{id}:close`,
+      `POST /v0/beads/issues/{id}:reopen`, `POST /v0/beads/issues:sweep`,
+      `POST /v0/beads/issues:delete`, `GET /v0/beads/config`,
+      `GET /v0/beads/config/{key}`, `POST /v0/beads/dependencies:add`,
+      `POST /v0/beads/dependencies:remove`) reject every query key the same
+      way.
+
+    * **Request media type.** Every operation that carries a request body
+      requires `Content-Type: application/json` and refuses anything else with
+      `400` / `code: invalid_argument` / `param: "Content-Type"` /
+      `reason: "invalid_value"`. The refusal is a CSRF control rather than
+      pedantry: a JSON content type is not CORS-simple, so a cross-origin write
+      always triggers a preflight this server never approves, and accepting
+      `text/plain` or a form encoding would let an attacker's page skip that
+      preflight and drive a write from any browser on the host. It is
+      unreachable for a client generated from this document — every
+      `requestBody` here declares `application/json` — and is stated so that
+      the one 400 such a client could not otherwise predict is predictable.
+      `415` is deliberately not used: it is not in this surface's status
+      vocabulary, and adding one for this would be permanent wire surface.
 
 
-    Both are uniform rules, reachable on EVERY route including `GET /healthz`,
-    and are stated here instead of being repeated on every operation. The
+    The first two are uniform rules reachable on EVERY route including
+    `GET /healthz`; the third holds on every body-carrying operation. All three
+    are stated here instead of being repeated on every operation. The
     per-operation `responses` below therefore list what an operation produces
-    BEYOND these two: a generated client must treat `400 invalid_argument` as
+    BEYOND them: a generated client must treat `400 invalid_argument` as
     possible everywhere, including on the operations whose documented statuses
     are only `404`/`500`/`503`.
 
@@ -1189,16 +1207,34 @@ paths:
         fallback when no issue matches.
 
 
-        COMMENT BODIES AND DEPENDENTS ARE NOT REACHABLE OVER v0. This operation
-        takes no query parameters, and every query key is rejected, so there is
-        no way to ask for them: `comments` and `dependents` are always absent,
-        and `comment_count`, `dependent_count` and `comments_omitted` are what
-        this surface reports about them. A workflow that must read comment text
-        keeps using `bd show --json --include-comments` for now. Adding
-        `include_comments` / `include_dependents` parameters later is additive
-        and needs no schema change — the fields are already specified.
+        COMMENT BODIES AND DEPENDENTS ARE ASKED FOR, NEVER VOLUNTEERED. They
+        are the two expensive row lists on this read, so each is absent unless
+        the request sets the parameter that populates it, and a caller that
+        wants only the cardinalities reads `comment_count`, `dependent_count`
+        and `comments_omitted` and pays for neither. A request that sets
+        neither parameter is answered exactly as this operation answered it
+        before the parameters existed.
       parameters:
         - $ref: '#/components/parameters/IssueID'
+        - name: include_comments
+          in: query
+          description: >-
+            Populate `comments` with the issue's full comment bodies. When it
+            is honored `comments_omitted` is false, so a client is never left
+            to guess whether an absent list means "no comments" or "not asked
+            for".
+          schema:
+            type: boolean
+            default: false
+        - name: include_dependents
+          in: query
+          description: >-
+            Populate `dependents` with the issues that depend on this one, each
+            carrying its edge type — the shape `dependencies` already carries.
+            Default false, for `include_comments`'s reason.
+          schema:
+            type: boolean
+            default: false
       responses:
         '200':
           description: The issue.
@@ -1206,6 +1242,132 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/IssueDetails'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+    patch:
+      operationId: updateIssue
+      summary: Edit the fields of one issue
+      description: >-
+        Partial update of one named issue. A plain `PATCH` rather than a custom
+        method, because partial update of one named resource is what `PATCH`
+        already means — exactly as one named resource with no body is what
+        `DELETE` means for `forgetMemory`. The custom-method namespace is left
+        for the operations that are not CRUD.
+
+
+        ## Member presence is the signal
+
+
+        A member PRESENT in `patch` is written; a member ABSENT is left
+        untouched. That is the whole partial-update rule, and it is why an
+        absent member and a member set to its current value are different
+        requests with the same outcome.
+
+
+        Explicit `null` is defined per member. On the four NULLABLE members —
+        `estimated_minutes`, `external_ref`, `due_at`, `defer_until` — it
+        CLEARS the value, because `null` is the only wire spelling a clear has.
+        On every other member it is a `400` naming the member, so a null is
+        never quietly recorded as an empty string.
+
+
+        An EMPTY `patch` object is a `400`: a write that writes nothing is a
+        client bug, the same judgement `issues:batchCreate` makes about an
+        empty `items`.
+
+
+        `labels` is COMPLETE REPLACEMENT. It is the only shape whose result the
+        client already knows without a read-back; an additive
+        `labels_add`/`labels_remove` pair can join the vocabulary later without
+        disturbing it.
+
+
+        `notes` and `append_notes` are mutually exclusive; sending both is a
+        `400`.
+
+
+        ## What this operation deliberately cannot edit
+
+
+        `status` — lifecycle is `{id}:close`, `{id}:reopen` and `{id}:claim`,
+        the operations that carry the policy and conflict vocabulary. A status
+        member here would smuggle close policy into this operation's code set
+        and publish two ways to do one thing.
+
+
+        `assignee` — assignment is the claim's compare-and-set territory, and a
+        raw assignee write would need the claim's conflict vocabulary on this
+        operation too. An unclaim/transfer operation is future surface.
+
+
+        `metadata` — its replace/merge/set/unset algebra deserves its own
+        design pass, not a corner of this one.
+
+
+        Also absent, and additive to publish later: `parent_id` (a set value
+        atomically replaces ALL parents — a graph edit in patch clothing),
+        `persistence` (a plane move is an atomic aggregate migration),
+        `owner` (`assignee`'s argument), `closed_by_session` (written under
+        first-close-wins by `{id}:close`, which a patch write would bypass),
+        and `spec_id`/`await_id` (workflow plumbing this surface publishes
+        nowhere yet). Keeping the first three out is half the reason this
+        operation documents no `409` at all.
+
+
+        ## Planes
+
+
+        The id resolves across BOTH planes, as the close and reopen do. An
+        update whose target is a wisp lands on the unversioned plane and
+        records no durable history entry.
+
+
+        ## Hooks and auto-commit
+
+
+        Hooks do not fire and the per-command auto-commit machinery does not
+        run, exactly as for `POST /v0/beads/issues/{id}:claim`. The only
+        durable effect is the single storage commit the role makes in its own
+        transaction.
+      parameters:
+        - $ref: '#/components/parameters/IssueID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateIssueRequest'
+      responses:
+        '200':
+          description: >-
+            The update was applied. A same-value patch is a 200 with
+            `changed: false`, not an error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateIssueResponse'
+        '400':
+          description: >-
+            Invalid request: an unknown query parameter, an unparseable or
+            oversized body, an unknown body member at either level, an `actor`
+            that is empty after trimming, longer than 256 bytes, or carrying
+            control characters, an empty `patch`, a member carrying the wrong
+            JSON type, an explicit `null` on a member that is not nullable, a
+            value outside its documented bounds, `notes` together with
+            `append_notes` — or a value this workspace's own validation
+            refuses, such as an `issue_type` outside its configured vocabulary.
+          x-bd-codes: [invalid_argument]
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
@@ -1267,6 +1429,194 @@ paths:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v0/beads/issues/{id}:close:
+    post:
+      operationId: closeIssue
+      summary: Close one issue
+      description: >-
+        Closes the issue this path names, moving it to the literal `closed`
+        status including from a configured done status. It is the half of the
+        agent loop — claim, work, close — that this surface did not serve
+        before.
+
+
+        A named lifecycle action rather than a status patch, because the close
+        carries semantics a patch has nowhere to put: the reason and session
+        under first-close-wins, the done-status normalization, and the close
+        POLICY vocabulary below.
+
+
+        THE FIRST CLOSE WINS. A re-close of an already-closed issue is
+        idempotent — 200 with `already_closed: true` — and writes neither
+        `reason` nor `session`, so a replayed close cannot rewrite the record of
+        why the work ended. The stored pair keeps what the first close gave it
+        until a reopen clears both.
+
+
+        ## Close policy
+
+
+        An unforced close is refused with `409` / `not_closable` when the issue
+        has open children (the refusal carries `open_children`, the count the
+        refusing transaction observed) or a live blocker (no such member). The
+        MEMBER'S PRESENCE is the discriminator, so telling the two apart never
+        requires reading `detail`. Both refusals are the ROLE's, so `force`
+        bypasses those two and nothing else — this endpoint cannot skip a guard
+        by forgetting one exists.
+
+
+        ## Planes
+
+
+        The id resolves across BOTH planes, unlike
+        `POST /v0/beads/issues/{id}:claim`. A close whose target is a wisp lands
+        on the unversioned plane and records no durable history entry.
+
+
+        ## Hooks and auto-commit
+
+
+        Hooks do not fire and the per-command auto-commit machinery does not
+        run, exactly as for `POST /v0/beads/issues/{id}:claim`. The only durable
+        effect is the single storage commit the role makes in its own
+        transaction.
+      parameters:
+        - $ref: '#/components/parameters/IssueID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloseIssueRequest'
+      responses:
+        '200':
+          description: The issue is closed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CloseIssueResponse'
+        '400':
+          description: >-
+            Invalid request: an unknown query parameter, an unparseable or
+            oversized body, an unknown body member, an `actor` that is empty
+            after trimming, longer than 256 bytes, or carrying control
+            characters — or a `reason` or `session` longer than the column
+            holds or carrying control characters.
+          x-bd-codes: [invalid_argument]
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: >-
+            Close policy refused an unforced close (`not_closable`): the issue
+            has open children — carrying the `open_children` extension member —
+            or a live blocker, which carries none. Resend with `force: true` to
+            bypass both. Nothing was written.
+          x-bd-codes: [not_closable]
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v0/beads/issues/{id}:reopen:
+    post:
+      operationId: reopenIssue
+      summary: Reopen one issue
+      description: >-
+        Moves the literal `closed` status and every configured done status back
+        to `open`. It is `POST /v0/beads/issues/{id}:close`'s mirror, and it
+        completes the lifecycle pair so a recovery flow works end to end over
+        this surface.
+
+
+        A reopen of an issue that is NOT done changes nothing and succeeds —
+        200 with `already_open: true`, the re-claim's and the re-close's answer
+        to the same question. An agent replaying its own recovery should not
+        have to classify an error to learn it already ran.
+
+
+        Reopening CLEARS `close_reason` and `closed_by_session`, because they
+        describe a closure that no longer holds. That is what makes the close's
+        first-close-wins rule survivable: the way to write a new reason is to
+        reopen and close again, not to re-close.
+
+
+        ## Where the reason is recorded
+
+
+        On the `reopened` EVENT this move records, not on a field of the issue,
+        and the response does not carry it. A caller that wants it back reads
+        the issue's events — the same place the actor attribution for the
+        reopen lives. A reopen with no reason still records that entry; it
+        simply carries none.
+
+
+        ## No conflict to name
+
+
+        This operation documents no `409`, and the absence is deliberate:
+        reopen has no policy guard. Close has one — open children, a live
+        blocker — and reopen is the direction that removes an issue from the
+        done category rather than adding it, so there is nothing for a policy
+        to refuse.
+
+
+        ## Planes
+
+
+        The id resolves across BOTH planes, as the close does. A reopen whose
+        target is a wisp lands on the unversioned plane and records no durable
+        history entry.
+
+
+        ## Hooks and auto-commit
+
+
+        Hooks do not fire and the per-command auto-commit machinery does not
+        run, exactly as for `POST /v0/beads/issues/{id}:claim`. The only
+        durable effect is the single storage commit the role makes in its own
+        transaction.
+      parameters:
+        - $ref: '#/components/parameters/IssueID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReopenIssueRequest'
+      responses:
+        '200':
+          description: The issue is open.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReopenIssueResponse'
+        '400':
+          description: >-
+            Invalid request: an unknown query parameter, an unparseable or
+            oversized body, an unknown body member, an `actor` that is empty
+            after trimming, longer than 256 bytes, or carrying control
+            characters — or a `reason` longer than the column holds or carrying
+            control characters.
+          x-bd-codes: [invalid_argument]
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/InternalError'
         '503':
@@ -1816,6 +2166,197 @@ paths:
         '503':
           $ref: '#/components/responses/Unavailable'
 
+  /v0/beads/dependencies:add:
+    post:
+      operationId: addDependencies
+      summary: Assert dependency edges as one act
+      description: >-
+        Asserts every edge in the request, or none of them.
+
+
+        IT IS ALL-OR-NOTHING, and unlike a batch close that is not a policy
+        choice but the shape of the question. Edges asserted together describe a
+        GRAPH, and half a graph is a graph nobody asked for — the cycle a caller
+        was refused for is exactly the state a partial commit would leave
+        behind. A client that gets a 4xx knows nothing was written, and can fix
+        its payload and resend it unchanged. There is no per-edge outcome
+        because there is no outcome but the request's.
+
+
+        AN EDGE IS IDEMPOTENT AT ITS OWN TYPE. A pair that already carries an
+        edge of the requested type refuses nothing and is still echoed in
+        `added`; a pair that carries a DIFFERENT type is a `409`
+        `dependency_exists`, whichever of the two types was stored first.
+        Repetition WITHIN one request answers the same way: the second
+        occurrence of a pair finds the first already written, and two different
+        types for one pair in one request is the same `409`.
+
+
+        A TARGET NEED NOT BE AN ISSUE THIS DATABASE HOLDS. An `external:`
+        reference and an id belonging to another repository are legitimate
+        targets — the vocabulary is open — so only an absence this database can
+        SEE is refused. A SOURCE has no such latitude: an edge follows its
+        source, so a source this database holds no row for has no plane to land
+        in.
+
+
+        Edges are applied parent-child first regardless of request order, so the
+        complete planned hierarchy is visible before any blocking edge is
+        validated against it, and a whole-graph gate runs once at the end. Both
+        hold ACROSS the durable and ephemeral planes: a request may mix them,
+        and it is still one transaction.
+
+
+        A request that wrote no genuinely new durable edge records no history
+        entry, and a request made entirely of wisp-sourced edges records none
+        either — an edge follows its source, and the wisp plane is not
+        versioned. Each genuinely new edge records a `dependency_added` entry on
+        its source's event stream, attributed to `actor`.
+
+
+        Hooks do not fire and the per-command auto-commit machinery does not
+        run, exactly as for `POST /v0/beads/issues/{id}:claim`. The only durable
+        effect is the single storage commit the role makes in its own
+        transaction.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddDependenciesRequest'
+      responses:
+        '200':
+          description: >-
+            Every edge landed. `added` echoes the request's edges in request
+            order.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AddDependenciesResponse'
+        '400':
+          description: >-
+            Invalid request: an unknown query parameter, an unparseable or
+            oversized body, an unknown body member at any level, an `actor` that
+            is empty after trimming, longer than 256 bytes or carrying control
+            characters, an empty or over-long `edges` array, a blank or
+            over-long endpoint id, an unstorable `type`, an edge that points an
+            issue at ITSELF, or an edge endpoint that names nothing this
+            database can see. Nothing is written in any of these cases.
+
+
+            A self-dependency is a `400` rather than a `409` because it is
+            request-intrinsic: it is invalid whatever the graph holds, so it is
+            a refusal of a VALUE and not a statement about state. An endpoint
+            that names nothing is a `400` rather than a `404` for
+            `POST /v0/beads/issues:batchCreate`'s reason: the refusal is about
+            the request BODY, and there is no id in the path to have missed.
+          x-bd-codes: [invalid_argument]
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: >-
+            The graph refuses the requested edge set, and NOTHING WAS WRITTEN.
+
+
+            `dependency_cycle` means the set can never make progress: a
+            scheduling cycle, or a blocking edge against the issue's own
+            ancestor or descendant. The hierarchy case — and ONLY the hierarchy
+            case — additionally carries `issue_id`, `blocker_id` and
+            `blocker_is_ancestor`. Member PRESENCE is the discriminator: absent
+            means the plain cycle refusal, present means the hierarchy one, and
+            the three together are enough to rebuild the refusal whole rather
+            than parse it out of prose.
+
+
+            `dependency_exists` means the pair already carries an edge of a
+            DIFFERENT type; `existing_type` and `requested_type` carry both.
+
+
+            Neither has a force bypass. The recovery for both is to rethink the
+            edge, which is why they are one status and not a retry.
+          x-bd-codes: [dependency_cycle, dependency_exists]
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v0/beads/dependencies:remove:
+    post:
+      operationId: removeDependency
+      summary: Remove one dependency edge
+      description: >-
+        Removes exactly the edge the request names — source, target — and at
+        most that one edge.
+
+
+        IT IS IDEMPOTENT, and `removed: false` is a SUCCESS rather than a
+        refusal. Removing an edge twice leaves the same graph as removing it
+        once, so an agent replaying its own teardown does not have to classify
+        an error to discover it already ran. Nothing is written for it and no
+        event is recorded.
+
+
+        THERE IS NO `404` ON THIS OPERATION, deliberately. An edge that is not
+        there is `removed: false`, and an endpoint id that names nothing holds
+        no edge either, so this operation probes no id's existence and has
+        nothing it could report a miss on.
+
+
+        It is a collection-level custom method rather than a `DELETE`: an edge
+        is named by TWO endpoints, so there is no single-segment resource path
+        for a `DELETE` to address, and a `DELETE` carrying a body is the shape
+        proxies mangle. `DELETE /v0/beads/memories/{key}` is a `DELETE` for the
+        opposite reason — one named resource, no body.
+
+
+        A removal that found its edge records a `dependency_removed` entry on
+        the source's event stream, attributed to `actor`. An edge FOLLOWS ITS
+        SOURCE, so a wisp-sourced edge is removed from the unversioned plane
+        and leaves no durable history entry.
+
+
+        Hooks do not fire and the per-command auto-commit machinery does not
+        run, exactly as for `POST /v0/beads/issues/{id}:claim`. The only
+        durable effect is the single storage commit the role makes in its own
+        transaction.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RemoveDependencyRequest'
+      responses:
+        '200':
+          description: >-
+            The removal ran. `removed` says whether an edge was there to
+            remove.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemoveDependencyResponse'
+        '400':
+          description: >-
+            Invalid request: an unknown query parameter, an unparseable or
+            oversized body, an unknown body member, a missing or non-string
+            member, an `actor` that is empty after trimming, longer than 256
+            bytes or carrying control characters, or an endpoint id that is
+            empty or longer than storage holds. Nothing is removed.
+          x-bd-codes: [invalid_argument]
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
   /v0/beads/memories:
     get:
       operationId: listMemories
@@ -2275,6 +2816,21 @@ components:
           description: >-
             `bug`, `feature`, `task`, `epic`, `chore`, `gate`, and workspace
             configured types. Not a closed vocabulary.
+        is_blocked:
+          type: boolean
+          description: >-
+            The persisted readiness projection — true when an open blocking
+            dependency keeps this issue out of the ready set. Derived from the
+            dependency graph; never set by a client.
+
+
+            NOT POPULATED by the /v0 read endpoints today: they hydrate issues
+            without it, so the field is absent from their responses and its
+            absence says nothing about whether an issue is blocked. Use
+            `/v0/beads/ready` or the dependency endpoints to answer that. The
+            field is carried by events-journal snapshots, which is where it is
+            read back, and it is documented here because those snapshots
+            serialize the same type this schema is pinned to.
         assignee:
           type: string
           description: The actor currently holding the issue, if any.
@@ -2452,6 +3008,7 @@ components:
         status: { type: string }
         priority: { type: integer }
         issue_type: { type: string }
+        is_blocked: { type: boolean }
         assignee: { type: string }
         owner: { type: string }
         estimated_minutes: { type: integer }
@@ -2540,6 +3097,7 @@ components:
         status: { type: string }
         priority: { type: integer }
         issue_type: { type: string }
+        is_blocked: { type: boolean }
         assignee: { type: string }
         owner: { type: string }
         estimated_minutes: { type: integer }
@@ -2595,19 +3153,18 @@ components:
         comments:
           type: array
           description: >-
-            NOT POPULATED IN v0 — `getIssue` has no parameter that requests
-            comment bodies and rejects every query key, so this is always
-            absent. Use `comment_count` and `comments_omitted`. Documented
-            because the struct carries the field and a later version may add
-            the parameter that fills it.
+            The issue's comment bodies. Populated only when the request sets
+            `getIssue`'s `include_comments`; absent otherwise, which is what
+            `comment_count` and `comments_omitted` report about.
           items: { $ref: '#/components/schemas/Comment' }
         # --- added by IssueDetails ---
         dependents:
           type: array
           description: >-
-            Issues that depend on this one, each carrying its edge type. NOT
-            POPULATED IN v0, for the same reason as `comments`: use
-            `dependent_count`.
+            Issues that depend on this one, each carrying its edge type.
+            Populated only when the request sets `getIssue`'s
+            `include_dependents`; absent otherwise, where `dependent_count` is
+            the cardinality.
           items: { $ref: '#/components/schemas/IssueWithDependencyMetadata' }
         parent:
           type: string
@@ -2625,10 +3182,9 @@ components:
           type: boolean
           description: >-
             True when `comment_count` is nonzero and `comments` was left out —
-            which over v0 HTTP is every such issue, since bodies cannot be
-            requested. Without it, an absent `comments` key is ambiguous
-            between "no comments" and "comments not included in this
-            response".
+            every such issue on a request that did not set `include_comments`.
+            Without it, an absent `comments` key is ambiguous between "no
+            comments" and "comments not included in this response".
         epic_total_children:
           type: integer
         epic_closed_children:
@@ -2658,6 +3214,7 @@ components:
         status: { type: string }
         priority: { type: integer }
         issue_type: { type: string }
+        is_blocked: { type: boolean }
         assignee: { type: string }
         owner: { type: string }
         estimated_minutes: { type: integer }
@@ -2743,6 +3300,7 @@ components:
         status: { type: string }
         priority: { type: integer }
         issue_type: { type: string }
+        is_blocked: { type: boolean }
         assignee: { type: string }
         owner: { type: string }
         estimated_minutes: { type: integer }
@@ -3148,9 +3706,11 @@ components:
             The operations this server actually implements, derived from its
             route table. v0's vocabulary is `ready.list`, `ready.count`,
             `issues.list`, `issues.query`, `issues.get`, `issues.claim`,
+            `issues.close`, `issues.reopen`, `issues.update`,
             `issues.sweep`, `issues.delete`, `issues.batchCreate`,
             `stats.get`, `config.list`, `config.get`, `dependencies.cycles`,
             `dependencies.list`, `dependencies.blocking`, `dependencies.tree`,
+            `dependencies.add`, `dependencies.remove`,
             `memories.list`, `memories.get`, `memories.remember`,
             `memories.forget`;
             it grows additively, and an operation never
@@ -3222,7 +3782,7 @@ components:
           type: string
           minLength: 1
           maxLength: 256
-          pattern: '^[^\u0000-\u001F\u007F]+$'
+          pattern: '^[^\u0000-\u001F\u007F-\u009F\u2028\u2029]+$'
           description: >-
             Caller-asserted attribution, under the same rules as
             `SweepRequest`'s `actor`: trimmed, refused when empty after
@@ -3350,7 +3910,7 @@ components:
           type: string
           minLength: 1
           maxLength: 256
-          pattern: '^[^\u0000-\u001F\u007F]+$'
+          pattern: '^[^\u0000-\u001F\u007F-\u009F\u2028\u2029]+$'
           description: >-
             Caller-asserted attribution for wherever the backend records it,
             under the same rules and for the same reasons as `ClaimRequest`'s
@@ -3889,7 +4449,7 @@ components:
           type: string
           minLength: 1
           maxLength: 256
-          pattern: '^[^\u0000-\u001F\u007F]+$'
+          pattern: '^[^\u0000-\u001F\u007F-\u009F\u2028\u2029]+$'
           description: >-
             Who is creating the issues, under `ClaimRequest.actor`'s rules and
             for the same reasons: the server trims it, refuses an empty result,
@@ -4001,6 +4561,144 @@ components:
           items:
             $ref: '#/components/schemas/Issue'
 
+    AddDependenciesRequest:
+      type: object
+      additionalProperties: false
+      required: [actor, edges]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: '^[^\u0000-\u001F\u007F-\u009F\u2028\u2029]+$'
+          description: >-
+            Who is asserting the edges, under `ClaimRequest.actor`'s rules and
+            for the same reasons: the server trims it, refuses an empty result,
+            anything longer than 256 BYTES, and any control character including
+            newline. It is attributed on each `dependency_added` event a
+            genuinely new edge records, and interpolated into the storage commit
+            message.
+        edges:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: >-
+            The edges to assert, in the caller's order. An empty array is a
+            `400` rather than a successful no-op: a write request that writes
+            nothing is a client bug, and answering it cheerfully is how a client
+            whose own list filtered to nothing silently stops wiring anything.
+
+
+            The 100-edge cap is a bound on how long one request may hold a write
+            transaction, not a statement about batch semantics. Split a larger
+            graph; each request is atomic on its own — but note that splitting
+            it changes what the cycle gate can see, since the gate runs over one
+            request at a time.
+
+
+            A per-edge refusal names its offender as `edges[i].member`.
+          items:
+            $ref: '#/components/schemas/DependencyEdge'
+
+    DependencyEdge:
+      type: object
+      additionalProperties: false
+      required: [issue_id, depends_on_id, type]
+      description: >-
+        One directed edge, as a REQUEST names it. It is not `Dependency`, which
+        is the stored row `GET /v0/beads/dependencies` returns and carries the
+        columns storage assigned; this is the three members a caller supplies.
+      properties:
+        issue_id:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: >-
+            The edge's SOURCE — the issue that depends on the other end. An
+            EXACT canonical id, and one this database holds: an edge follows its
+            source, so a source that names nothing is a `400`.
+        depends_on_id:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: >-
+            The edge's TARGET — the issue depended upon. An exact canonical id,
+            an `external:` reference, or an id belonging to another repository.
+            Only an absence this database can SEE is refused. It must differ
+            from `issue_id`.
+        type:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: >-
+            The edge type, from the same OPEN vocabulary `Dependency.type`
+            carries: checked for being a storable value, never for membership of
+            a known-types list, so a workspace's own type passes.
+
+    AddDependenciesResponse:
+      type: object
+      required: [added]
+      properties:
+        added:
+          type: array
+          description: >-
+            The request's edges, in REQUEST ORDER. It echoes the request because
+            all-or-nothing means it is either every edge or the call failed, so
+            a caller reporting what landed reads the result and never has to
+            know which of the two it is safe to read. An idempotent same-type
+            re-add is echoed like any other edge; the response does not say
+            which edges were genuinely new, because nothing a client does
+            depends on that.
+
+
+            Never null and never shorter than the request: a partial outcome
+            does not exist on this operation.
+          items:
+            $ref: '#/components/schemas/DependencyEdge'
+
+    RemoveDependencyRequest:
+      type: object
+      additionalProperties: false
+      required: [actor, issue_id, depends_on_id]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: '^[^\u0000-\u001F\u007F-\u009F\u2028\u2029]+$'
+          description: >-
+            Who is removing the edge, under `ClaimRequest.actor`'s rules and
+            for the same reasons: the server trims it, refuses an empty result,
+            anything longer than 256 BYTES, and any control character including
+            newline. It is attributed on the `dependency_removed` event a real
+            removal records, and interpolated into the storage commit message.
+        issue_id:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: >-
+            The edge's SOURCE — the issue that depends on the other end. An
+            EXACT canonical id: there is no fuzzy, prefix or substring
+            resolution on this surface.
+        depends_on_id:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: >-
+            The edge's TARGET — the issue depended upon. An exact canonical id,
+            under `issue_id`'s rule.
+
+    RemoveDependencyResponse:
+      type: object
+      required: [removed]
+      properties:
+        removed:
+          type: boolean
+          description: >-
+            True when an edge was there and is now gone. FALSE IS A SUCCESS,
+            not a refusal: it says this pair carried no such edge, which is the
+            same graph a second removal leaves. Nothing was written for it.
+
     ClaimRequest:
       type: object
       additionalProperties: false
@@ -4010,14 +4708,22 @@ components:
           type: string
           minLength: 1
           maxLength: 256
-          pattern: '^[^\u0000-\u001F\u007F]+$'
+          pattern: '^[^\u0000-\u001F\u007F-\u009F\u2028\u2029]+$'
           description: >-
             Who is claiming the issue. The server trims it, then refuses an
             empty result, anything longer than 256 BYTES (the `maxLength` above
             counts characters — the byte limit is the binding one), and any
-            control character including newline. The value is persisted as the
-            assignee and interpolated into the storage commit message, so an
-            unvalidated newline would forge audit-trail lines.
+            control character including newline: Unicode category Cc — C0, DEL
+            and the C1 block — plus the U+2028/U+2029 line separators, which is
+            the set the `pattern` above spells.
+
+
+            The value is persisted as the assignee and interpolated into the
+            storage commit message, so an unvalidated newline would forge
+            audit-trail lines. C1 is refused for that same reason and not for
+            tidiness: U+0085 is a line break on a VT-conformant terminal, and
+            U+009B is the one-byte CSI introducer, which would make an actor an
+            escape-sequence payload in anything that prints an assignee.
 
     ClaimResponse:
       type: object
@@ -4031,6 +4737,223 @@ components:
             True when the caller already held the issue and this call changed
             nothing — the idempotent re-claim. A claim held by a DIFFERENT
             actor is a 409, not a 200 with this flag.
+
+    CloseIssueRequest:
+      type: object
+      additionalProperties: false
+      required: [actor]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: '^[^\u0000-\u001F\u007F-\u009F\u2028\u2029]+$'
+          description: >-
+            Who is closing the issue. `ClaimRequest.actor`'s rules exactly: the
+            server trims it, then refuses an empty result, anything longer than
+            256 BYTES (the `maxLength` above counts characters — the byte limit
+            is the binding one), and any control character including newline.
+            The value reaches stored columns, event-stream attribution and the
+            storage commit message, so an unvalidated newline would forge
+            audit-trail lines.
+        reason:
+          type: string
+          maxLength: 255
+          description: >-
+            Why the issue is closed. Stored on the issue and read back as
+            `close_reason`. THE FIRST CLOSE WINS: an idempotent re-close writes
+            neither this nor `session`, so a replayed close cannot rewrite the
+            record of why the work ended. Refused for control characters, and
+            bounded by what the column holds rather than by the number above.
+        session:
+          type: string
+          maxLength: 255
+          description: >-
+            The working session that closed the issue, stored and read back as
+            `closed_by_session`, under the same first-close-wins rule and the
+            same bounds as `reason`.
+        force:
+          type: boolean
+          default: false
+          description: >-
+            Bypass close policy — the open-children refusal and the
+            live-blocker refusal — and nothing else. The refusals are the
+            ROLE's, so this endpoint cannot skip a guard by forgetting one
+            exists. A forced close still reports `open_children`.
+
+    CloseIssueResponse:
+      type: object
+      required: [issue, already_closed, open_children]
+      properties:
+        issue:
+          $ref: '#/components/schemas/Issue'
+        already_closed:
+          type: boolean
+          description: >-
+            True when the issue was already closed and this call changed
+            nothing — the idempotent re-close, mirroring
+            `ClaimResponse.already_claimed`. The response still carries the
+            row, and `reason`/`session` were not rewritten.
+        open_children:
+          type: integer
+          description: >-
+            How many open children the close observed. Reported by a FORCED
+            close — including an idempotent re-close — because a caller that
+            bypassed the guard is exactly the caller that wants the number. An
+            unforced close that got this far had none, so it reports 0.
+
+    ReopenIssueRequest:
+      type: object
+      additionalProperties: false
+      required: [actor]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: '^[^\u0000-\u001F\u007F-\u009F\u2028\u2029]+$'
+          description: >-
+            Who is reopening the issue. `ClaimRequest.actor`'s rules exactly:
+            the server trims it, then refuses an empty result, anything longer
+            than 256 BYTES (the `maxLength` above counts characters — the byte
+            limit is the binding one), and any control character including
+            newline. The value reaches the `reopened` event's attribution and
+            the storage commit message, so an unvalidated newline would forge
+            audit-trail lines.
+        reason:
+          type: string
+          maxLength: 255
+          description: >-
+            Why the issue is being reopened. Recorded on the `reopened` EVENT
+            this move records — not on a field of the issue, and not carried in
+            the response, so a caller that wants it back reads the issue's
+            events. Refused for control characters, and bounded by what the
+            column holds rather than by the number above.
+
+    ReopenIssueResponse:
+      type: object
+      required: [issue, already_open]
+      properties:
+        issue:
+          $ref: '#/components/schemas/Issue'
+        already_open:
+          type: boolean
+          description: >-
+            True when the issue was not in a done status and this call changed
+            nothing — idempotent, mirroring `CloseIssueResponse.already_closed`
+            and `ClaimResponse.already_claimed`. The response still carries the
+            row.
+
+    UpdateIssueRequest:
+      type: object
+      additionalProperties: false
+      required: [actor, patch]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: '^[^\u0000-\u001F\u007F-\u009F\u2028\u2029]+$'
+          description: >-
+            Who is editing the issue. `ClaimRequest.actor`'s rules exactly: the
+            server trims it, then refuses an empty result, anything longer than
+            256 BYTES (the `maxLength` above counts characters — the byte limit
+            is the binding one), and any control character including newline.
+            The value reaches the history entry's attribution and the storage
+            commit message, so an unvalidated newline would forge audit-trail
+            lines.
+        patch:
+          $ref: '#/components/schemas/IssuePatchBody'
+
+    IssuePatchBody:
+      type: object
+      additionalProperties: false
+      description: >-
+        The fields to write. Every member is optional and PRESENCE is the
+        signal: a member present is written, a member absent is untouched. An
+        empty object is a `400` — a write that writes nothing is a client bug.
+
+
+        This is a deliberate SUBSET of the fields an issue carries; the members
+        it does not spell are future surface rather than oversights, and
+        `updateIssue`'s own description says which and why.
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: >-
+            The issue's title. Must not be blank after trimming; the length
+            bound is what the column holds.
+        description:
+          type: string
+        design:
+          type: string
+        acceptance_criteria:
+          type: string
+        notes:
+          type: string
+          description: >-
+            Replaces the notes. Mutually exclusive with `append_notes`; sending
+            both is a `400`.
+        append_notes:
+          type: string
+          description: >-
+            Appends to the notes rather than replacing them. Mutually exclusive
+            with `notes`.
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 4
+        issue_type:
+          type: string
+          maxLength: 255
+          description: >-
+            The issue type, from this workspace's own configured vocabulary. A
+            type outside it is refused by the ROLE and reaches the client as a
+            `400` — this server cannot read the vocabulary without a
+            transaction, so it checks only what this schema declares.
+        labels:
+          type: array
+          items:
+            type: string
+            maxLength: 255
+          description: >-
+            COMPLETE REPLACEMENT of the label set. An empty array clears every
+            label. Incremental add/remove is deferred: replacement is the only
+            shape whose result the client already knows without a read-back.
+        estimated_minutes:
+          type: integer
+          nullable: true
+          description: 'Explicit `null` CLEARS the estimate.'
+        external_ref:
+          type: string
+          nullable: true
+          maxLength: 255
+          description: 'Explicit `null` CLEARS the reference.'
+        due_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 'RFC 3339. Explicit `null` CLEARS the due date.'
+        defer_until:
+          type: string
+          format: date-time
+          nullable: true
+          description: 'RFC 3339. Explicit `null` CLEARS the deferral.'
+
+    UpdateIssueResponse:
+      type: object
+      required: [issue, changed]
+      properties:
+        issue:
+          $ref: '#/components/schemas/Issue'
+        changed:
+          type: boolean
+          description: >-
+            Whether the request persisted a semantic mutation. A same-value
+            patch is a 200 with `changed: false` rather than an error —
+            idempotent, like every replay answer on this surface.
 
     Problem:
       type: object
@@ -4063,7 +4986,9 @@ components:
             may dispatch on. v0's vocabulary: `invalid_argument` (400, also
             emitted by the Host-header middleware on any route),
             `invalid_cursor` (400), `not_found` (404), `already_claimed` (409),
-            `not_claimable` (409), `busy` (503), `db_unavailable` (503),
+            `not_claimable` (409), `not_closable` (409),
+            `dependency_cycle` (409), `dependency_exists` (409), `busy` (503),
+            `db_unavailable` (503),
             `internal` (500). Renaming or removing a status+code pair is a
             breaking change; ADDING one is not, so clients MUST default-branch
             on unknown values and fall back to the status class (unknown 4xx →
@@ -4103,6 +5028,55 @@ components:
           description: >-
             With `already_claimed` or `not_claimable`: the issue's status at
             the moment of refusal.
+        open_children:
+          type: integer
+          description: >-
+            With `not_closable`: how many open children the transaction that
+            refused the close observed, read inside that transaction rather
+            than parsed out of `detail`.
+
+
+            PRESENT ONLY for the open-children refusal. The other
+            `not_closable` refusal is a live blocker and carries no such
+            member, so member presence — not prose — is how a client tells the
+            two apart. Both are bypassed by `force`.
+        existing_type:
+          type: string
+          description: >-
+            With `dependency_exists`: the type of the edge the pair already
+            carries, read inside the refusing transaction.
+        requested_type:
+          type: string
+          description: >-
+            With `dependency_exists`: the type the request asked for. Together
+            with `existing_type` it is the whole refusal, so a client never
+            parses either out of `detail`.
+        issue_id:
+          type: string
+          description: >-
+            With `dependency_cycle`, and ONLY on the hierarchy refusal: the
+            issue the requested blocking edge would have gated. Its PRESENCE is
+            the discriminator — absent means a plain scheduling cycle, present
+            means the edge pointed at the issue's own ancestor or descendant.
+
+
+            The conflicting hierarchy may exist only inside the rolled-back
+            batch, so no read after the fact can recover it: the refusing
+            transaction is the only place this member can come from.
+        blocker_id:
+          type: string
+          description: >-
+            With `dependency_cycle`, hierarchy refusal only: the ancestor or
+            descendant the edge named as blocker. See `issue_id`.
+        blocker_is_ancestor:
+          type: boolean
+          description: >-
+            With `dependency_cycle`, hierarchy refusal only: true when
+            `blocker_id` is an ANCESTOR of `issue_id` (which cannot close until
+            its descendants finish, so the gate would never clear), false when
+            it is a DESCENDANT (blocked status cascades, so it would inherit the
+            block and never close). Both polarities are reported; this member is
+            never omitted to mean false. See `issue_id`.
         request_id:
           type: string
           description: >-
