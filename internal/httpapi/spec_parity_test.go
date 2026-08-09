@@ -331,6 +331,58 @@ func TestSpecDefaultsMatchSharedConstants(t *testing.T) {
 	}
 }
 
+// capabilityToken matches one backticked capability token in the
+// `capabilities` description. The shape — a lowercase resource, a dot, a
+// lowerCamel verb — is what every token on this surface is, and it is narrow
+// enough that no other backticked word in that paragraph can be mistaken for
+// one.
+var capabilityToken = regexp.MustCompile("`([a-z]+\\.[a-zA-Z]+)`")
+
+// TestSpecCapabilityVocabularyMatchesTheRouteTable is the gate for the ONE
+// piece of per-operation plumbing that had no gate.
+//
+// The `capabilities` description enumerates every token explicitly, in prose,
+// and prose is not generated from anything: an operation could land with its
+// route row, its handler, its problem codes and its spec path all correct and
+// still never appear in the list a client is told to check. Nothing would fail.
+// The document would simply be wrong about the one member it tells clients to
+// dispatch on, and the drift would be discovered by a client, not by CI.
+//
+// Set equality both ways: a token in the prose with no implemented route is a
+// capability advertised to readers and not to clients, and a route whose token
+// the prose omits is an operation the document forgets it has.
+//
+// ORDER IS NOT CHECKED. The prose groups tokens by resource for a reader;
+// Capabilities() sorts them for a client. Both are deliberate, and pinning one
+// to the other would be a rule about paragraph layout.
+func TestSpecCapabilityVocabularyMatchesTheRouteTable(t *testing.T) {
+	doc := loadSpec(t)
+	schema := mapAt(t, mapAt(t, mapAt(t, doc, "components"), "schemas"), "ContextResponse")
+	caps := mapAt(t, mapAt(t, schema, "properties"), "capabilities")
+	desc, _ := caps["description"].(string)
+	if desc == "" {
+		t.Fatal("the capabilities property has no description; it is where the token vocabulary is published")
+	}
+
+	documented := map[string]bool{}
+	for _, m := range capabilityToken.FindAllStringSubmatch(desc, -1) {
+		documented[m[1]] = true
+	}
+	served := map[string]bool{}
+	for _, token := range Capabilities() {
+		served[token] = true
+	}
+
+	if missing := diff(served, documented); len(missing) > 0 {
+		t.Errorf("this build serves capabilities the document does not enumerate: %v\n"+
+			"add them to the `capabilities` description in internal/httpapi/spec/openapi.v0.yaml — "+
+			"that paragraph is the vocabulary a client is told to check", missing)
+	}
+	if extra := diff(documented, served); len(extra) > 0 {
+		t.Errorf("the document enumerates capabilities no implemented route contributes: %v", extra)
+	}
+}
+
 func specParam(t *testing.T, so specOp, name string) map[string]any {
 	t.Helper()
 	raw, ok := so.op["parameters"].([]any)
@@ -610,6 +662,246 @@ func TestClaimRequestMembersMatchTheHandler(t *testing.T) {
 	}
 	if missing := diff(accepted, specProps); len(missing) > 0 {
 		t.Errorf("the claim handler accepts members the ClaimRequest schema does not document: %v", missing)
+	}
+}
+
+// TestCloseRequestMembersMatchTheHandler is TestClaimRequestMembersMatchTheHandler
+// for the close body, and it exists for the same reason: the handler decodes
+// raw members so it can name the offending one, which makes the schema's
+// additionalProperties: false enforceable by a client that has stopped parsing
+// prose — at the cost of a hand-rolled copy of the member list with nothing
+// tying it to the document. A spec revision adding an optional member would
+// otherwise leave `make api-check` and every other spec test green while the
+// server refused the newly documented member as unknown_parameter.
+func TestCloseRequestMembersMatchTheHandler(t *testing.T) {
+	accepted := map[string]bool{}
+	for _, name := range closeRequestMembers {
+		accepted[name] = true
+	}
+
+	goFields := jsonTagNames(t, reflect.TypeOf(apigen.CloseIssueRequest{}))
+	if extra := diff(goFields, accepted); len(extra) > 0 {
+		t.Errorf("generated CloseIssueRequest declares members the close handler refuses as unknown: %v\n"+
+			"teach closeRequest to honor them, or the document promises a member the server turns down", extra)
+	}
+	if missing := diff(accepted, goFields); len(missing) > 0 {
+		t.Errorf("the close handler accepts members CloseIssueRequest does not declare: %v", missing)
+	}
+
+	doc := loadSpec(t)
+	schema := mapAt(t, mapAt(t, mapAt(t, doc, "components"), "schemas"), "CloseIssueRequest")
+	specProps := schemaProperties(t, doc, schema)
+	if extra := diff(specProps, accepted); len(extra) > 0 {
+		t.Errorf("the CloseIssueRequest schema documents members the close handler refuses: %v", extra)
+	}
+	if missing := diff(accepted, specProps); len(missing) > 0 {
+		t.Errorf("the close handler accepts members the CloseIssueRequest schema does not document: %v", missing)
+	}
+}
+
+// TestUpdateRequestMembersMatchTheHandler is the claim's and the close's gate
+// for the update body, at BOTH of its levels.
+//
+// It matters more here than anywhere else on the surface: `patch` is the widest
+// member list published, and the handler's accepted set is a hand-rolled copy
+// of it because presence has to be observable. A spec revision adding an
+// optional patch member would otherwise leave `make api-check` and every other
+// spec test green while the server refused the newly documented member as
+// unknown_parameter — and the reverse, a member the handler honors that the
+// document never promised, is undisclosed write surface on a mutation.
+func TestUpdateRequestMembersMatchTheHandler(t *testing.T) {
+	doc := loadSpec(t)
+	schemas := mapAt(t, mapAt(t, doc, "components"), "schemas")
+
+	for _, tc := range []struct {
+		schema   string
+		accepted []string
+		goType   reflect.Type
+	}{
+		{"UpdateIssueRequest", updateRequestMembers, reflect.TypeOf(apigen.UpdateIssueRequest{})},
+		{"IssuePatchBody", issuePatchMembers, reflect.TypeOf(apigen.IssuePatchBody{})},
+	} {
+		t.Run(tc.schema, func(t *testing.T) {
+			accepted := map[string]bool{}
+			for _, name := range tc.accepted {
+				accepted[name] = true
+			}
+
+			goFields := jsonTagNames(t, tc.goType)
+			if extra := diff(goFields, accepted); len(extra) > 0 {
+				t.Errorf("generated %s declares members the update handler refuses as unknown: %v\n"+
+					"teach the handler to honor them, or the document promises a member the server turns down", tc.schema, extra)
+			}
+			if missing := diff(accepted, goFields); len(missing) > 0 {
+				t.Errorf("the update handler accepts members %s does not declare: %v", tc.schema, missing)
+			}
+
+			specProps := schemaProperties(t, doc, mapAt(t, schemas, tc.schema))
+			if extra := diff(specProps, accepted); len(extra) > 0 {
+				t.Errorf("the %s schema documents members the update handler refuses: %v", tc.schema, extra)
+			}
+			if missing := diff(accepted, specProps); len(missing) > 0 {
+				t.Errorf("the update handler accepts members the %s schema does not document: %v", tc.schema, missing)
+			}
+		})
+	}
+}
+
+// TestReopenRequestMembersMatchTheHandler is the claim's and the close's gate
+// for the reopen body. The reopen decodes raw members for the same reason its
+// mirror does — so a refusal can name the offending one, which is what makes
+// the schema's additionalProperties: false enforceable by a client that has
+// stopped parsing prose — and pays the same price: a hand-rolled copy of the
+// member list with nothing tying it to the document.
+func TestReopenRequestMembersMatchTheHandler(t *testing.T) {
+	accepted := map[string]bool{}
+	for _, name := range reopenRequestMembers {
+		accepted[name] = true
+	}
+
+	goFields := jsonTagNames(t, reflect.TypeOf(apigen.ReopenIssueRequest{}))
+	if extra := diff(goFields, accepted); len(extra) > 0 {
+		t.Errorf("generated ReopenIssueRequest declares members the reopen handler refuses as unknown: %v\n"+
+			"teach reopenRequest to honor them, or the document promises a member the server turns down", extra)
+	}
+	if missing := diff(accepted, goFields); len(missing) > 0 {
+		t.Errorf("the reopen handler accepts members ReopenIssueRequest does not declare: %v", missing)
+	}
+
+	doc := loadSpec(t)
+	schema := mapAt(t, mapAt(t, mapAt(t, doc, "components"), "schemas"), "ReopenIssueRequest")
+	specProps := schemaProperties(t, doc, schema)
+	if extra := diff(specProps, accepted); len(extra) > 0 {
+		t.Errorf("the ReopenIssueRequest schema documents members the reopen handler refuses: %v", extra)
+	}
+	if missing := diff(accepted, specProps); len(missing) > 0 {
+		t.Errorf("the reopen handler accepts members the ReopenIssueRequest schema does not document: %v", missing)
+	}
+}
+
+// TestDependencyRequestMembersMatchTheHandlers is the same gate for the two
+// dependency bodies, and for the add's NESTED level — the update's table-driven
+// form because, exactly as there, the body has a level below it.
+//
+// `edges[i]` is where this matters most on the graph side. It is the only
+// member list on the surface checked inside a loop, its refusals are reported
+// as `edges[i].member` rather than by bare name, and a member the document grew
+// there would be refused per edge with an index attached — a failure that reads
+// like a data problem in one row rather than like version skew, which is the
+// slowest possible way to discover a spec revision.
+func TestDependencyRequestMembersMatchTheHandlers(t *testing.T) {
+	doc := loadSpec(t)
+	schemas := mapAt(t, mapAt(t, doc, "components"), "schemas")
+
+	for _, tc := range []struct {
+		schema   string
+		accepted []string
+		goType   reflect.Type
+	}{
+		{"AddDependenciesRequest", addDependenciesMembers, reflect.TypeOf(apigen.AddDependenciesRequest{})},
+		{"DependencyEdge", dependencyEdgeMembers, reflect.TypeOf(apigen.DependencyEdge{})},
+		{"RemoveDependencyRequest", removeDependencyMembers, reflect.TypeOf(apigen.RemoveDependencyRequest{})},
+	} {
+		t.Run(tc.schema, func(t *testing.T) {
+			accepted := map[string]bool{}
+			for _, name := range tc.accepted {
+				accepted[name] = true
+			}
+
+			goFields := jsonTagNames(t, tc.goType)
+			if extra := diff(goFields, accepted); len(extra) > 0 {
+				t.Errorf("generated %s declares members the handler refuses as unknown: %v\n"+
+					"teach the handler to honor them, or the document promises a member the server turns down", tc.schema, extra)
+			}
+			if missing := diff(accepted, goFields); len(missing) > 0 {
+				t.Errorf("the handler accepts members %s does not declare: %v", tc.schema, missing)
+			}
+
+			specProps := schemaProperties(t, doc, mapAt(t, schemas, tc.schema))
+			if extra := diff(specProps, accepted); len(extra) > 0 {
+				t.Errorf("the %s schema documents members the handler refuses: %v", tc.schema, extra)
+			}
+			if missing := diff(accepted, specProps); len(missing) > 0 {
+				t.Errorf("the handler accepts members the %s schema does not document: %v", tc.schema, missing)
+			}
+		})
+	}
+}
+
+// TestNullablePatchMembersAreExactlyTheDocumentsNullableOnes pins the closed set
+// on which explicit `null` CLEARS rather than refuses.
+//
+// The two sides can drift silently and in the worst direction: a member the
+// document marks nullable but the handler does not would refuse a clear the
+// contract promises, and a member the handler treats as nullable but the
+// document does not would let a null through as an unannounced clear on a field
+// nobody agreed could be cleared.
+func TestNullablePatchMembersAreExactlyTheDocumentsNullableOnes(t *testing.T) {
+	doc := loadSpec(t)
+	schema := mapAt(t, mapAt(t, mapAt(t, doc, "components"), "schemas"), "IssuePatchBody")
+
+	documented := map[string]bool{}
+	for name, raw := range mapAt(t, schema, "properties") {
+		prop, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("property %q is %T, want a mapping", name, raw)
+		}
+		if nullable, _ := prop["nullable"].(bool); nullable {
+			documented[name] = true
+		}
+	}
+
+	if missing := diff(documented, nullablePatchMembers); len(missing) > 0 {
+		t.Errorf("the document marks these patch members nullable and the handler refuses a null on them: %v\n"+
+			"a clear the contract promises would be answered with a 400", missing)
+	}
+	if extra := diff(nullablePatchMembers, documented); len(extra) > 0 {
+		t.Errorf("the handler clears these patch members on an explicit null and the document does not declare them nullable: %v\n"+
+			"that is an unannounced clear on a field nobody agreed could be cleared", extra)
+	}
+}
+
+// TestCustomMethodRowsDeclareTheirDocumentedPath bounds the routing exception
+// from the side TestSpecRouteParity cannot see. That test compares DECLARED
+// spec paths, so it stays green whatever the customMethod field says; the
+// dispatcher, meanwhile, chooses a row purely by that field. If the two
+// disagree — a row whose specPath ends in `:close` while its customMethod is
+// `:reopen` — the documented path would reach the wrong operation with every
+// gate passing.
+//
+// It also pins the invariant the dispatcher depends on: no two rows on one
+// pattern may claim the same suffix, and a row that shares a pattern must
+// declare one.
+func TestCustomMethodRowsDeclareTheirDocumentedPath(t *testing.T) {
+	claimed := map[string]string{}
+	patterns := map[string]int{}
+	for _, rt := range routeTable {
+		patterns[rt.method+" "+rt.pattern]++
+	}
+	for _, rt := range routeTable {
+		key := rt.method + " " + rt.pattern
+		if rt.customMethod == "" {
+			if patterns[key] > 1 {
+				t.Errorf("%s shares the pattern %q with another row but declares no customMethod; "+
+					"the dispatcher has no way to choose between them", rt.op, rt.pattern)
+			}
+			continue
+		}
+		if rt.specPath == "" {
+			t.Errorf("%s declares customMethod %q but no specPath; the router cannot spell the documented path, "+
+				"so it must be declared", rt.op, rt.customMethod)
+			continue
+		}
+		if !strings.HasSuffix(rt.specPath, rt.customMethod) {
+			t.Errorf("%s: documented path %q does not end in the customMethod %q the dispatcher matches on; "+
+				"the documented path would reach a different operation",
+				rt.op, rt.specPath, rt.customMethod)
+		}
+		if prev, dup := claimed[key+rt.customMethod]; dup {
+			t.Errorf("%s and %s both claim the suffix %q on %q; the dispatcher would hand every such request to the first",
+				prev, rt.op, rt.customMethod, rt.pattern)
+		}
+		claimed[key+rt.customMethod] = rt.op
 	}
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/steveyegge/beads/internal/httpapi/apigen"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/uow"
+	"github.com/steveyegge/beads/issueops"
 )
 
 // Every non-2xx byte this server emits is an RFC 9457 problem+json document
@@ -36,7 +37,7 @@ import (
 // The vocabulary is a one-way door: renaming or removing a documented
 // status+code pair breaks the wire. Adding one does not, which is why clients
 // are told to default-branch on unknown codes within a status class. Keep it
-// at what the six v0 operations actually need.
+// at what the v0 operations actually need.
 type Code string
 
 // The v0 code vocabulary. Every value here is documented in the spec, and
@@ -58,6 +59,29 @@ const (
 	// sentinel's message text.
 	CodeAlreadyClaimed Code = "already_claimed"
 	CodeNotClaimable   Code = "not_claimable"
+	// CodeNotClosable is close policy refusing an unforced close: open
+	// children, or a live blocker. The open-children refusal carries the count
+	// in the `open_children` extension member, read inside the refusing
+	// transaction — never parsed out of the sentinel's message text — and its
+	// PRESENCE is how a client tells the two refusals apart without prose.
+	//
+	// A 409 rather than the delete precedent's 400: this is a statement about
+	// the current state of one named resource, so the same request succeeds or
+	// fails on state the client cannot see without reading it. That is the
+	// not_claimable situation and it gets the not_claimable answer.
+	CodeNotClosable Code = "not_closable"
+	// CodeDependencyCycle covers BOTH never-makes-progress refusals a requested
+	// edge set can earn: a scheduling cycle, and a blocking edge against the
+	// issue's own ancestor or descendant. They are one code because they have
+	// one client recovery — rethink the edge, with no force bypass for either —
+	// and codes are the vocabulary of recovery. The typed distinction is NOT
+	// lost: the hierarchy refusal additionally carries `issue_id`, `blocker_id`
+	// and `blocker_is_ancestor`, read inside the refusing transaction, and
+	// member presence is the discriminator.
+	CodeDependencyCycle Code = "dependency_cycle"
+	// CodeDependencyExists is the pair that already carries an edge of a
+	// DIFFERENT type, with both types in `existing_type`/`requested_type`.
+	CodeDependencyExists Code = "dependency_exists"
 	// CodeBusy is retryable contention: the transaction retry budget was
 	// exhausted, or the in-flight request limit was saturated.
 	CodeBusy Code = "busy"
@@ -77,14 +101,17 @@ const codeClientClosed Code = "client_closed"
 // codeStatus freezes one HTTP status per code. A code that could arrive with
 // two different statuses would defeat the point of dispatching on it.
 var codeStatus = map[Code]int{
-	CodeInvalidArgument: http.StatusBadRequest,
-	CodeInvalidCursor:   http.StatusBadRequest,
-	CodeNotFound:        http.StatusNotFound,
-	CodeAlreadyClaimed:  http.StatusConflict,
-	CodeNotClaimable:    http.StatusConflict,
-	CodeBusy:            http.StatusServiceUnavailable,
-	CodeDBUnavailable:   http.StatusServiceUnavailable,
-	CodeInternal:        http.StatusInternalServerError,
+	CodeInvalidArgument:  http.StatusBadRequest,
+	CodeInvalidCursor:    http.StatusBadRequest,
+	CodeNotFound:         http.StatusNotFound,
+	CodeAlreadyClaimed:   http.StatusConflict,
+	CodeNotClaimable:     http.StatusConflict,
+	CodeNotClosable:      http.StatusConflict,
+	CodeDependencyCycle:  http.StatusConflict,
+	CodeDependencyExists: http.StatusConflict,
+	CodeBusy:             http.StatusServiceUnavailable,
+	CodeDBUnavailable:    http.StatusServiceUnavailable,
+	CodeInternal:         http.StatusInternalServerError,
 }
 
 // Status returns the HTTP status frozen to c, or 0 if c is not in the v0
@@ -146,9 +173,84 @@ const (
 	OpHealth        = "health"
 	OpGetContext    = "getContext"
 	OpListReadyWork = "listReadyWork"
+	OpGetStats      = "getStats"
 	OpListIssues    = "listIssues"
 	OpGetIssue      = "getIssue"
 	OpClaimIssue    = "claimIssue"
+	// OpCloseIssue is the second half of the agent loop this surface exists to
+	// serve: claim, work, close. It is a named lifecycle action rather than a
+	// status patch because Close carries semantics a patch has nowhere to put —
+	// the reason and session under first-close-wins, the done-status
+	// normalization, and the close policy vocabulary.
+	OpCloseIssue = "closeIssue"
+	// OpReopenIssue is the close's mirror, and it completes the lifecycle pair
+	// so a recovery flow works end to end over this surface. It is the one
+	// write here with no conflict code: reopen has no policy guard.
+	OpReopenIssue = "reopenIssue"
+	// OpUpdateIssue edits the FIELDS of one issue. Lifecycle is deliberately not
+	// among them: status belongs to close/reopen/claim, which carry the policy
+	// and conflict vocabulary, and assignee belongs to the claim's
+	// compare-and-set. Keeping both out is why this operation has no 409.
+	OpUpdateIssue          = "updateIssue"
+	OpListSettings         = "listSettings"
+	OpGetSetting           = "getSetting"
+	OpListDependencyCycles = "listDependencyCycles"
+	// OpListDependencies reads STORED EDGE ROWS for several issues at once.
+	// It is a separate operation from getIssue's embedded `dependencies`
+	// member because it answers per named issue, reports the ids that named
+	// nothing, and returns edges whose target this database holds no row for.
+	OpListDependencies = "listDependencies"
+	// OpListBlockingAnnotations reads the DERIVED blocking decoration for
+	// several issues at once — open blockers, issues blocked, and the parent.
+	// It is separate from listDependencies because it answers a summary over
+	// two edge types with a status rule applied, where that one returns the
+	// stored rows and applies nothing.
+	OpListBlockingAnnotations = "listBlockingAnnotations"
+	// OpGetDependencyTree walks the dependency graph from ONE root. It is
+	// separate from listDependencies because that one answers raw edge rows for
+	// many anchors at one hop, and this one recurses from a single anchor with a
+	// depth, a cycle policy and a node shape of its own.
+	OpGetDependencyTree = "getDependencyTree"
+	OpCountReadyWork    = "countReadyWork"
+	OpQueryIssues       = "queryIssues"
+	// OpRemoveDependency is the first WRITE to the dependency graph on this
+	// surface, behind issueops.DependencyEditor. It names one edge by both its
+	// endpoints, because an edge has two and neither alone identifies it.
+	OpRemoveDependency = "removeDependency"
+	// OpAddDependencies is the graph's other write: a BATCH of edges asserted
+	// as one transaction, or none of them. It is the operation that owns both
+	// new conflict codes, because both are statements about the graph a
+	// requested edge set would produce.
+	OpAddDependencies = "addDependencies"
+	// OpSweepIssues is one of the two DESTRUCTIVE operations on this surface:
+	// bulk clearance of closed beads from one tier, behind issueops.Sweeper.
+	OpSweepIssues = "sweepIssues"
+	// OpDeleteIssues is the other DESTRUCTIVE operation: erasure of beads the
+	// request NAMES, behind issueops.Deleter. It is the one operation here whose
+	// refusals include a question about the GRAPH — a named bead with a
+	// dependent the request did not name.
+	OpDeleteIssues = "deleteIssues"
+	// OpBatchCreateIssues creates many issues as one transaction, or none.
+	OpBatchCreateIssues = "batchCreateIssues"
+	// OpRememberMemory stores one memory, behind memoryops.Memories. It is the
+	// first operation on this surface that reaches a role outside issueops: the
+	// memory plane is user data riding in the config table, not settings, and
+	// the two have different merge semantics and a different miss contract.
+	OpRememberMemory = "rememberMemory"
+	// OpGetMemory reads one memory by key. It is the ONE operation on this
+	// surface that answers a miss with a 404 where its settings counterpart
+	// deliberately does not: see its operationCodes row.
+	OpGetMemory = "getMemory"
+	// OpForgetMemory is the THIRD destructive operation on this surface, and the
+	// only one that is a DELETE method: it names one memory by path, carries no
+	// body and takes no flags, which is what that method already means. The two
+	// destructive issue operations are collection-level custom methods because
+	// they act on a set the request describes.
+	OpForgetMemory = "forgetMemory"
+	// OpListMemories enumerates the memory plane, narrowed by one search term.
+	// It is the operation that makes stored memories DISCOVERABLE rather than
+	// merely readable by a caller who already knows a key.
+	OpListMemories = "listMemories"
 )
 
 // operationCodes is the per-operation problem vocabulary: exactly the codes
@@ -161,8 +263,8 @@ const (
 // /healthz — the Host-header middleware, and the unknown-query-parameter
 // refusal every decoder performs — and both are deliberately absent from every
 // row here. They are uniform rules, not per-operation behavior, and the spec
-// documents them once at the document level rather than repeating them on all
-// six operations; these rows carry what an operation produces beyond them.
+// documents them once at the document level rather than repeating them on
+// every operation; these rows carry what an operation produces beyond them.
 // Keep the two documents in step: a row here and the document-level prose are
 // the only two places that carve-out exists.
 var operationCodes = map[string][]Code{
@@ -174,9 +276,145 @@ var operationCodes = map[string][]Code{
 	OpGetContext:    {CodeInternal},
 	OpListReadyWork: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
 	OpListIssues:    {CodeInvalidArgument, CodeInvalidCursor, CodeBusy, CodeDBUnavailable, CodeInternal},
-	OpGetIssue:      {CodeNotFound, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// The 400 is this operation's own, the getStats precedent: a malformed
+	// `include_comments` or `include_dependents` is a bad value on a parameter
+	// this server knows, not the document-level unknown-key rule this table
+	// omits.
+	OpGetIssue: {CodeInvalidArgument, CodeNotFound, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// No 400 of its own: the operation takes no parameters, so the only
+	// invalid_argument it can raise is the document-level unknown-query-key
+	// rule this table deliberately omits.
+	OpListSettings: {CodeBusy, CodeDBUnavailable, CodeInternal},
+	// No 404: a key nothing stored and a key stored as the empty string are one
+	// answer on this surface, so the only refusal a key can earn is the 400
+	// that says it was not a key.
+	OpGetSetting: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// The 400 here is this operation's own, not the document-level
+	// unknown-parameter rule: a malformed `skip_blocked`, and the EMPTY
+	// `assignee` the document refuses rather than answering with the rows that
+	// have no assignee.
+	OpGetStats: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// The cycle sweep takes no parameters at all, so it has no 400 of its own:
+	// the two uniform ones above are the whole of its invalid-argument story.
+	OpListDependencyCycles: {CodeBusy, CodeDBUnavailable, CodeInternal},
+	// No not_found here, deliberately: an id that names nothing is reported in
+	// the response's `missing` member, so a batch keeps the answers for the ids
+	// that were found. A 404 would discard them.
+	OpListDependencies: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// The same vocabulary as the stored-edge read beside it, and no not_found
+	// for a stronger version of the same reason: this operation probes no id's
+	// existence at all, so there is nothing it could 404 on.
+	OpListBlockingAnnotations: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// The 404 is the difference from the row above: this operation has ONE
+	// anchor, so there is no other answer to preserve by reporting the miss in
+	// the body. Its 400 is its own — an empty root, a direction outside the
+	// closed set, a non-positive max_depth — all three the ROLE's ErrValidation
+	// reaching the wire.
+	OpGetDependencyTree: {CodeInvalidArgument, CodeNotFound, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// The same vocabulary as the listing it sizes: it takes the same filters
+	// and can refuse them the same way. limit=0's mode-dependent refusal has no
+	// analog here because there is no limit to pass.
+	OpCountReadyWork: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// The listing's vocabulary minus the cursor: this operation has none, so
+	// invalid_cursor cannot arise. An unparseable EXPRESSION is an
+	// invalid_argument on `q` rather than a code of its own — a client's
+	// recovery is the same as for any other malformed parameter value.
+	OpQueryIssues: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// The 400 here is the widest on this surface, and most of it is not this
+	// handler's: the unfiltered durable sweep, the unrecognized tier and the
+	// malformed glob are all the ROLE's ErrValidation reaching the wire through
+	// failSweepErr. No 404 — this operation names no id — and no 409: a bead
+	// another sweep already took is simply not in the set.
+	OpSweepIssues: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// CodeNotFound is the one this operation has and the sweep does not: a
+	// sweep describes a set that can legitimately be empty, while a delete
+	// names beads and an id that resolves to nothing is a caller mistake.
+	OpDeleteIssues: {CodeInvalidArgument, CodeNotFound, CodeBusy, CodeDBUnavailable, CodeInternal},
 	OpClaimIssue: {
 		CodeInvalidArgument, CodeNotFound, CodeAlreadyClaimed, CodeNotClaimable,
+		CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
+	// The 409 is close POLICY, and it is the only conflict this operation has:
+	// an unforced close refused for open children or for a live blocker. There
+	// is no already_claimed here — closing work somebody else holds is not a
+	// refusal on this surface — and the idempotent re-close is a 200 carrying
+	// `already_closed`, the claim's answer to the same question.
+	OpCloseIssue: {
+		CodeInvalidArgument, CodeNotFound, CodeNotClosable,
+		CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
+	// NO 409, and the absence is the point. Close has a policy guard — open
+	// children, a live blocker — and reopen is the direction that takes an issue
+	// OUT of the done category rather than putting it in, so there is no state
+	// of the graph that can refuse it and nothing to name. The idempotent case
+	// is a 200 carrying `already_open`, not a conflict.
+	OpReopenIssue: {
+		CodeInvalidArgument, CodeNotFound,
+		CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
+	// No conflict code, and the excluded members are exactly where one would
+	// have entered: `status` would drag in close policy, `assignee` the claim
+	// fence, `parent_id` the graph vocabulary. The 400 is the body vocabulary
+	// plus the ROLE's ErrValidation — a workspace-vocabulary issue_type, a
+	// field-length refusal that slipped the edge check — through failUpdate.
+	OpUpdateIssue: {
+		CodeInvalidArgument, CodeNotFound,
+		CodeBusy, CodeDBUnavailable, CodeInternal,
+	},
+	// No not_found. The role refuses an edge whose target names nothing, and
+	// that refusal is about the REQUEST BODY the client sent, not about a
+	// resource this operation was asked to address — there is no id in the path
+	// to have missed. A 404 here would tell a client its request went to the
+	// wrong place.
+	//
+	// No conflict code either: this operation publishes no `id` member, so no
+	// item can collide with a stored row and the role's ErrAlreadyExists is
+	// unreachable from the wire.
+	OpBatchCreateIssues: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// No 404 and no conflict code: this is an UPSERT with a server-derivable
+	// key, so there is no resource it can fail to address and no row it can
+	// collide with. Its 400 is the body vocabulary plus the ROLE's two
+	// refusals — empty content, and content no key can be derived from.
+	OpRememberMemory: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// THE 404 IS THE DIVERGENCE, and it is deliberate. OpGetSetting has none
+	// because on that plane an absent key and a key stored empty are one answer
+	// the CLI itself prints identically, so a 404 would publish an invented
+	// distinction. Here the CLI already distinguishes a miss — `bd recall` has
+	// an exit-code contract for it — and the role answers Found rather than a
+	// value, so the 404 reports a distinction that exists. The stored-empty row
+	// falls on the miss side of it, which the document states.
+	OpGetMemory: {CodeInvalidArgument, CodeNotFound, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// The read's vocabulary exactly, because the two operations address the same
+	// resource the same way and this one's Found false is the same answer: a key
+	// nothing stored is a 404 and nothing was removed. No 409 — a memory another
+	// caller already forgot is simply not there, which is what the 404 says.
+	OpForgetMemory: {CodeInvalidArgument, CodeNotFound, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// The 400 here IS this operation's own, unlike listSettings' absent row: it
+	// has one parameter, and a repeated `q` is refused rather than resolved to
+	// one of its values. No 404 — a search matching nothing is an empty page,
+	// because a question about a set has an answer even when the set is empty.
+	OpListMemories: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// NO 404, for a stronger version of the batch create's reason: an edge that
+	// is not there is `removed: false`, and an endpoint id that names nothing
+	// holds no edge either, so this operation probes no id's existence and has
+	// nothing it could report a miss on — listBlockingAnnotations' argument,
+	// applied to a write. No conflict code either: the removal is idempotent, so
+	// another caller having got there first is a success rather than a collision.
+	OpRemoveDependency: {CodeInvalidArgument, CodeBusy, CodeDBUnavailable, CodeInternal},
+	// The two conflict codes are this operation's alone, and both say the same
+	// kind of thing: the request is fine as a request and the GRAPH refuses it,
+	// which the caller cannot know without reading state it does not have. That
+	// is the claim's not_claimable situation and it gets the claim's answer, a
+	// typed 409 whose extension members are read inside the refusing
+	// transaction. The delete's 400-for-a-graph-refusal precedent does not
+	// apply: that one is about request COMPLETENESS — send cascade or force —
+	// and neither of these has a force to send.
+	//
+	// No 404: an endpoint that names nothing is a refusal of the request BODY,
+	// so it joins the 400 with every other body refusal (batchCreateIssues'
+	// argument). Nothing was written in any of these cases.
+	OpAddDependencies: {
+		CodeInvalidArgument, CodeDependencyCycle, CodeDependencyExists,
 		CodeBusy, CodeDBUnavailable, CodeInternal,
 	},
 }
@@ -204,15 +442,58 @@ func (r Result) WithIssueStatus(status string) Result {
 	return r
 }
 
-// WithRequestID attaches the `request_id` extension member, the correlation id
-// echoed in the request log line. It is what makes a 5xx actionable: the body
-// carries a fixed static detail by design, so the id is the client's only
-// handle on the one log line that has the real error.
+// WithOpenChildren attaches the `open_children` extension member (how many open
+// children the transaction that refused a close observed). Same rule as
+// WithAssignee: it comes from the typed error's own field, read inside that
+// transaction, never from parsing the refusal's prose.
+//
+// Its PRESENCE is load-bearing. It is attached for the open-children refusal
+// and withheld for the live-blocker one, which is how a client tells the two
+// apart without reading `detail`.
+func (r Result) WithOpenChildren(n int) Result {
+	r.Problem.OpenChildren = &n
+	return r
+}
+
+// WithDependencyTypeConflict attaches the two `dependency_exists` extension
+// members: the type the pair already carries and the type the request asked
+// for. Populate them from *issueops.DependencyTypeConflictError's fields — the
+// typed error the role raises inside the transaction that saw the stored edge —
+// never by parsing its message.
+func (r Result) WithDependencyTypeConflict(existing, requested string) Result {
+	r.Problem.ExistingType = &existing
+	r.Problem.RequestedType = &requested
+	return r
+}
+
+// WithHierarchyConflict attaches the three extension members that distinguish
+// the HIERARCHY refusal from a plain scheduling cycle inside the one
+// `dependency_cycle` code. Their PRESENCE is the discriminator, and the three
+// together are enough to rebuild
+// *issueops.DependencyHierarchyConflictError whole — BlockerIsAncestor in both
+// polarities included, which is why the boolean travels through a pointer and
+// is emitted when false.
+//
+// They can only come from the refusing transaction, for the reason
+// ClaimConflictError's do and more so: the conflicting hierarchy may exist only
+// inside the batch that was rolled back, so no read after the fact can recover
+// it.
+func (r Result) WithHierarchyConflict(issueID, blockerID string, blockerIsAncestor bool) Result {
+	r.Problem.IssueId = &issueID
+	r.Problem.BlockerId = &blockerID
+	r.Problem.BlockerIsAncestor = &blockerIsAncestor
+	return r
+}
+
+// WithRequestID sets the `request_id` member, the correlation id echoed in the
+// request log line. It is what makes a 5xx actionable: the body carries a fixed
+// static detail by design, so the id is the client's only handle on the one log
+// line that has the real error. The document requires it on every problem
+// response, which is why this sets it unconditionally — an id this server
+// failed to mint travels as an empty string rather than as a missing required
+// member.
 func (r Result) WithRequestID(id string) Result {
-	if id == "" {
-		return r
-	}
-	r.Problem.RequestId = &id
+	r.Problem.RequestId = id
 	return r
 }
 
@@ -269,6 +550,18 @@ func NotFound() Result {
 	return newResult(CodeNotFound, "no issue or wisp with that id")
 }
 
+// MemoryNotFound builds the 404 for a key this workspace holds no memory under.
+//
+// A separate constructor rather than a detail argument on NotFound, because the
+// two say different things: that one is about the issue id space, and reusing
+// its sentence here would tell a client its memory key was an issue id. The
+// detail deliberately does NOT distinguish an absent row from one stored as the
+// empty string — the role cannot see the difference, so the wire must not claim
+// to.
+func MemoryNotFound() Result {
+	return newResult(CodeNotFound, "this workspace holds no memory under that key")
+}
+
 // ClassifyError maps an error from the storage seam onto the wire. The caller
 // is responsible for logging err: everything mapped to a 5xx deliberately
 // drops the error text on the floor (see staticDetail).
@@ -292,6 +585,17 @@ func ClassifyError(err error) Result {
 
 	case errors.Is(err, storage.ErrNotClaimable):
 		return newResult(CodeNotClaimable, "issue is not in a claimable state")
+
+	// The two close-policy refusals share one code. They are the same statement
+	// to a client — the close was refused for the state of the graph around
+	// this issue, and `force` is the bypass for both — and what distinguishes
+	// them on the wire is the `open_children` member failClose attaches, not a
+	// second vocabulary entry.
+	case errors.Is(err, issueops.ErrCloseOpenChildren):
+		return newResult(CodeNotClosable, "issue has open children; close them first or close with force")
+
+	case errors.Is(err, issueops.ErrCloseBlocked):
+		return newResult(CodeNotClosable, "issue is blocked; clear the blocker or close with force")
 
 	case errors.Is(err, ErrBusy):
 		res := newResult(CodeBusy, "")

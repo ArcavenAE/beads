@@ -40,12 +40,30 @@ type sqlServerUOWTopology struct {
 	rootPassword      string
 }
 
+// previewProviderOptions is the CLI-side half of the preview policy: it turns
+// the root pre-run's previewMode bool into the uow.ProviderOption slice the
+// proxied-server provider is opened with. Extracted (rather than inlined at
+// the call site) so the wiring — preview=true must produce uow.WithPreview(),
+// preview=false must produce nothing — has something to unit test; the
+// previous inline form had no test that would fail if a refactor dropped it.
+func previewProviderOptions(preview bool) []uow.ProviderOption {
+	if !preview {
+		return nil
+	}
+	return []uow.ProviderOption{uow.WithPreview()}
+}
+
 // newProxiedServerUOWProvider opens the proxied-server provider and, in
 // team-server mode, asserts that the shared bts-managed database is serving
 // THIS workspace's project (gastownhall/beads: the proxied-path sibling of the
 // gateway's DoltStore.verifyProjectIdentity guard).
-func newProxiedServerUOWProvider(ctx context.Context, beadsDir, databaseOverride string) (uow.UnitOfWorkProvider, error) {
-	return openProxiedServerUOWProvider(ctx, beadsDir, databaseOverride, assertWorkspaceIdentity)
+//
+// opts carry the open's posture that is not workspace topology — today only
+// uow.WithPreview(), which the root pre-run passes for --dry-run/--inspect so
+// a proxied preview does not create or migrate the database before the
+// command's own RunE runs.
+func newProxiedServerUOWProvider(ctx context.Context, beadsDir, databaseOverride string, opts ...uow.ProviderOption) (uow.UnitOfWorkProvider, error) {
+	return openProxiedServerUOWProvider(ctx, beadsDir, databaseOverride, assertWorkspaceIdentity, opts...)
 }
 
 // newProxiedServerUOWProviderAdopting skips that assertion. Only two callers
@@ -53,8 +71,8 @@ func newProxiedServerUOWProvider(ctx context.Context, beadsDir, databaseOverride
 // which ADOPTS the identity the shared database already carries (asserting the
 // locally-minted placeholder would reject every correct init), and server-wide
 // database maintenance, which is not scoped to one project's database.
-func newProxiedServerUOWProviderAdopting(ctx context.Context, beadsDir, databaseOverride string) (uow.UnitOfWorkProvider, error) {
-	return openProxiedServerUOWProvider(ctx, beadsDir, databaseOverride, adoptWorkspaceIdentity)
+func newProxiedServerUOWProviderAdopting(ctx context.Context, beadsDir, databaseOverride string, opts ...uow.ProviderOption) (uow.UnitOfWorkProvider, error) {
+	return openProxiedServerUOWProvider(ctx, beadsDir, databaseOverride, adoptWorkspaceIdentity, opts...)
 }
 
 // identityPosture selects whether a proxied open asserts the workspace's
@@ -66,7 +84,7 @@ const (
 	adoptWorkspaceIdentity  identityPosture = true
 )
 
-func openProxiedServerUOWProvider(ctx context.Context, beadsDir, databaseOverride string, posture identityPosture) (uow.UnitOfWorkProvider, error) {
+func openProxiedServerUOWProvider(ctx context.Context, beadsDir, databaseOverride string, posture identityPosture, opts ...uow.ProviderOption) (uow.UnitOfWorkProvider, error) {
 	if beadsDir == "" {
 		return nil, fmt.Errorf("newProxiedServerUOWProvider: beadsDir must be set")
 	}
@@ -74,29 +92,38 @@ func openProxiedServerUOWProvider(ctx context.Context, beadsDir, databaseOverrid
 	if err != nil {
 		return nil, err
 	}
-	return newSQLServerUOWProvider(ctx, beadsDir, topology)
+	return newSQLServerUOWProvider(ctx, beadsDir, topology, opts...)
 }
 
-func newSQLServerUOWProvider(ctx context.Context, beadsDir string, topology sqlServerUOWTopology) (uow.UnitOfWorkProvider, error) {
+// newSQLServerUOWProvider is the single funnel every unit-of-work provider bd
+// builds passes through — the proxied CLI path AND `bd serve`'s own provider
+// for server-mode workspaces. Activation is applied by the two constructors it
+// dispatches to, each alongside its own open; doing it at the CALL SITES
+// instead is what left `bd serve` writing mutations into an empty journal while
+// reporting success. See the note at the top of events_journal.go.
+func newSQLServerUOWProvider(ctx context.Context, beadsDir string, topology sqlServerUOWTopology, opts ...uow.ProviderOption) (uow.UnitOfWorkProvider, error) {
 	if topology.external != nil {
-		return newExternalProxiedServerUOWProvider(ctx, beadsDir, topology)
+		return newExternalProxiedServerUOWProvider(ctx, beadsDir, topology, opts...)
 	}
-	return newManagedProxiedServerUOWProvider(ctx, beadsDir, topology)
+	return newManagedProxiedServerUOWProvider(ctx, beadsDir, topology, opts...)
 }
 
 // resolveProxiedServerUOWTopology reads a proxied-server workspace's topology
-// out of metadata.json and the proxied-server sidecar. Neither read is fatal:
-// an absent or unreadable one leaves the defaults, which is the behavior every
-// proxied command has had, and the provider construction below is where a
-// workspace that cannot be reached actually fails. The one refusal it can
-// return is the team-server workspace with no identity to assert.
+// out of metadata.json and the proxied-server sidecar. An ABSENT file is not
+// fatal — both loads return (nil, nil) then, the defaults apply, and the
+// provider construction below is where a workspace that cannot be reached
+// actually fails. A file that EXISTS but cannot be read or parsed IS fatal
+// (restores f880a985b, reverted in #4418; bd-aj3g5): swallowing it silently
+// falls back to a fresh managed local database — reads return zero issues and
+// writes land in the wrong database (split-brain) — and the identity assertion
+// below silently degrades to no assertion at all.
 func resolveProxiedServerUOWTopology(beadsDir, databaseOverride string, posture identityPosture) (sqlServerUOWTopology, error) {
-	// NOTE: a load error is swallowed here (pre-existing behavior), which
-	// leaves persisted == nil and therefore silently falls back to the default
-	// database with teamServer=false. The identity assertion below inherits
-	// that: an unreadable metadata.json degrades to no assertion rather than a
-	// refusal. Tracked separately with the wider silent-fallback smell.
-	persisted, _ := configfile.Load(beadsDir)
+	persisted, err := configfile.Load(beadsDir)
+	if err != nil {
+		return sqlServerUOWTopology{}, fmt.Errorf(
+			"corrupt workspace config %s: %w — refusing to fall back to a fresh database; repair or remove the file to proceed",
+			configfile.ConfigPath(beadsDir), err)
+	}
 	topology := sqlServerUOWTopology{database: configfile.DefaultDoltDatabase}
 	if persisted != nil {
 		topology.database = persisted.GetDoltDatabase()
@@ -119,7 +146,12 @@ func resolveProxiedServerUOWTopology(beadsDir, databaseOverride string, posture 
 		topology.database = databaseOverride
 	}
 
-	info, _ := configfile.LoadProxiedServerClientInfo(beadsDir)
+	info, err := configfile.LoadProxiedServerClientInfo(beadsDir)
+	if err != nil {
+		return sqlServerUOWTopology{}, fmt.Errorf(
+			"corrupt proxied-server sidecar %s: %w — refusing to fall back to a fresh database; repair or remove the file to proceed",
+			configfile.ProxiedServerClientInfoPath(beadsDir), err)
+	}
 	if info != nil {
 		topology.proxyPort = info.Port
 		topology.proxyIdle = info.IdleTimeout
@@ -135,6 +167,8 @@ func resolveProxiedServerUOWTopology(beadsDir, databaseOverride string, posture 
 // probe waits, matching the store open's budget so both consumers make the same
 // call on the same workspace.
 const serverModeSocketProbeTimeout = 500 * time.Millisecond
+
+type socketTransportResolver func(socket, host string, port int, timeout time.Duration) string
 
 // errServeGatewayCredential refuses a workspace that authenticates to Dolt with
 // a minted credential.
@@ -178,6 +212,10 @@ func errServeGatewayCredential() error {
 // workspace's database: it is the one place --global is applied, and the
 // handshake must not name a database the provider did not open.
 func resolveServerModeUOWTopology(ctx context.Context, beadsDir string) (sqlServerUOWTopology, error) {
+	return resolveServerModeUOWTopologyWithTransportResolver(ctx, beadsDir, dolt.ResolveSocketTransport)
+}
+
+func resolveServerModeUOWTopologyWithTransportResolver(ctx context.Context, beadsDir string, resolveTransport socketTransportResolver) (sqlServerUOWTopology, error) {
 	if beadsDir == "" {
 		return sqlServerUOWTopology{}, fmt.Errorf("resolveServerModeUOWTopology: beadsDir must be set")
 	}
@@ -233,7 +271,7 @@ func resolveServerModeUOWTopology(ctx context.Context, beadsDir string) (sqlServ
 	// currently connectable must not block a workspace whose server answers over
 	// TCP. Without this, serve fails to construct in a workspace where every CLI
 	// command succeeds.
-	socket := dolt.ResolveSocketTransport(conn.ServerSocket, conn.ServerHost, conn.ServerPort, serverModeSocketProbeTimeout)
+	socket := resolveTransport(conn.ServerSocket, conn.ServerHost, conn.ServerPort, serverModeSocketProbeTimeout)
 	switch {
 	case socket != "":
 		external.Socket = socket
@@ -291,7 +329,8 @@ func resolveServerModeUOWTopology(ctx context.Context, beadsDir string) (sqlServ
 // the workspace mode: since bd-emv a server-mode workspace lands here too, and
 // the paths it resolves (root, log) are the same ones proxied mode uses because
 // both modes root their server at the same directory.
-func newExternalProxiedServerUOWProvider(ctx context.Context, beadsDir string, topology sqlServerUOWTopology) (uow.UnitOfWorkProvider, error) {
+func newExternalProxiedServerUOWProvider(ctx context.Context, beadsDir string, topology sqlServerUOWTopology, opts ...uow.ProviderOption) (p uow.UnitOfWorkProvider, err error) {
+	defer func() { p, err = activateEventsJournalProvider(ctx, beadsDir, p, err) }()
 	rootPath, err := resolveProxiedServerRootPath(beadsDir)
 	if err != nil {
 		return nil, fmt.Errorf("newExternalProxiedServerUOWProvider: resolve root path: %w", err)
@@ -326,10 +365,12 @@ func newExternalProxiedServerUOWProvider(ctx context.Context, beadsDir string, t
 		topology.proxyIdle,
 		topology.teamServer,
 		topology.expectedProjectID,
+		opts...,
 	)
 }
 
-func newManagedProxiedServerUOWProvider(ctx context.Context, beadsDir string, topology sqlServerUOWTopology) (uow.UnitOfWorkProvider, error) {
+func newManagedProxiedServerUOWProvider(ctx context.Context, beadsDir string, topology sqlServerUOWTopology, opts ...uow.ProviderOption) (p uow.UnitOfWorkProvider, err error) {
+	defer func() { p, err = activateEventsJournalProvider(ctx, beadsDir, p, err) }()
 	doltBin, err := exec.LookPath("dolt")
 	if err != nil {
 		return nil, fmt.Errorf("newProxiedServerUOWProvider: dolt is not installed (not found in PATH); install from https://docs.dolthub.com/introduction/installation: %w", err)
@@ -343,13 +384,7 @@ func newManagedProxiedServerUOWProvider(ctx context.Context, beadsDir string, to
 		return nil, fmt.Errorf("newProxiedServerUOWProvider: proxied server root (from env or %s): %w", configfile.ProxiedServerClientInfoFileName, err)
 	}
 
-	// Gate auto_gc_behavior.archive_level: 0 on the resolved external dolt's
-	// version — Dolt's YAML config loader uses yaml.UnmarshalStrict, so an
-	// older dolt whose own YAMLConfig struct lacks this field would refuse
-	// to start rather than ignore the unknown key (gastownhall/beads#4986).
-	archiveLevelSupported := doltserver.SupportsArchiveLevelConfig(doltBin)
-
-	configPath, err := ensureProxiedServerConfig(beadsDir, archiveLevelSupported)
+	configPath, err := ensureProxiedServerConfig(beadsDir)
 	if err != nil {
 		return nil, err
 	}
@@ -378,5 +413,6 @@ func newManagedProxiedServerUOWProvider(ctx context.Context, beadsDir string, to
 		topology.proxyIdle,
 		topology.teamServer,
 		topology.expectedProjectID,
+		opts...,
 	)
 }

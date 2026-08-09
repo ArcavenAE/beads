@@ -147,6 +147,16 @@ func TestApplyNoGitHooksToCmdComposesWithCredentials(t *testing.T) {
 	}
 }
 
+// unsetEnvForTest removes key for the duration of the test, restoring the
+// ambient value on cleanup.
+func unsetEnvForTest(t *testing.T, key string) {
+	t.Helper()
+	t.Setenv(key, "")
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatalf("unset %s: %v", key, err)
+	}
+}
+
 func TestWithRemoteOperationEnvRestoresS3ChecksumEnv(t *testing.T) {
 	t.Setenv(awsResponseChecksumValidationEnv, "when_supported")
 
@@ -165,10 +175,7 @@ func TestWithRemoteOperationEnvRestoresS3ChecksumEnv(t *testing.T) {
 }
 
 func TestWithRemoteOperationEnvUnsetsS3ChecksumEnv(t *testing.T) {
-	t.Setenv(awsResponseChecksumValidationEnv, "")
-	if err := os.Unsetenv(awsResponseChecksumValidationEnv); err != nil {
-		t.Fatalf("unset %s: %v", awsResponseChecksumValidationEnv, err)
-	}
+	unsetEnvForTest(t, awsResponseChecksumValidationEnv)
 
 	err := withRemoteOperationEnv(nil, true, func() error {
 		if got := os.Getenv(awsResponseChecksumValidationEnv); got != "when_required" {
@@ -181,6 +188,125 @@ func TestWithRemoteOperationEnvUnsetsS3ChecksumEnv(t *testing.T) {
 	}
 	if _, ok := os.LookupEnv(awsResponseChecksumValidationEnv); ok {
 		t.Fatalf("%s should be unset after operation", awsResponseChecksumValidationEnv)
+	}
+}
+
+// TestWithRemoteOperationEnvRestoresAmbientCredentials verifies that stored
+// credentials override an ambient DOLT_REMOTE_USER/DOLT_REMOTE_PASSWORD pair
+// for the operation and hand it back afterwards. Unsetting on cleanup would
+// destroy credentials the remote operation never owned.
+func TestWithRemoteOperationEnvRestoresAmbientCredentials(t *testing.T) {
+	t.Setenv("DOLT_REMOTE_USER", "ambient-user")
+	t.Setenv("DOLT_REMOTE_PASSWORD", "ambient-pass")
+
+	creds := &remoteCredentials{username: "peer-user", password: "peer-pass"}
+	err := withRemoteOperationEnv(creds, false, func() error {
+		if got := os.Getenv("DOLT_REMOTE_USER"); got != "peer-user" {
+			t.Fatalf("DOLT_REMOTE_USER during operation = %q, want peer-user", got)
+		}
+		if got := os.Getenv("DOLT_REMOTE_PASSWORD"); got != "peer-pass" {
+			t.Fatalf("DOLT_REMOTE_PASSWORD during operation = %q, want peer-pass", got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withRemoteOperationEnv returned error: %v", err)
+	}
+
+	if got := os.Getenv("DOLT_REMOTE_USER"); got != "ambient-user" {
+		t.Fatalf("DOLT_REMOTE_USER after operation = %q, want restored ambient-user", got)
+	}
+	if got := os.Getenv("DOLT_REMOTE_PASSWORD"); got != "ambient-pass" {
+		t.Fatalf("DOLT_REMOTE_PASSWORD after operation = %q, want restored ambient-pass", got)
+	}
+}
+
+// TestWithRemoteOperationEnvRestoresPartialAmbientCredentials covers the mixed
+// case: a var that was set comes back, a var that was unset stays unset.
+func TestWithRemoteOperationEnvRestoresPartialAmbientCredentials(t *testing.T) {
+	t.Setenv("DOLT_REMOTE_USER", "ambient-user")
+	unsetEnvForTest(t, "DOLT_REMOTE_PASSWORD")
+
+	creds := &remoteCredentials{username: "peer-user", password: "peer-pass"}
+	err := withRemoteOperationEnv(creds, false, func() error {
+		if got := os.Getenv("DOLT_REMOTE_PASSWORD"); got != "peer-pass" {
+			t.Fatalf("DOLT_REMOTE_PASSWORD during operation = %q, want peer-pass", got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withRemoteOperationEnv returned error: %v", err)
+	}
+
+	if got := os.Getenv("DOLT_REMOTE_USER"); got != "ambient-user" {
+		t.Fatalf("DOLT_REMOTE_USER after operation = %q, want restored ambient-user", got)
+	}
+	if _, ok := os.LookupEnv("DOLT_REMOTE_PASSWORD"); ok {
+		t.Fatal("DOLT_REMOTE_PASSWORD should be unset after operation (it was unset before)")
+	}
+}
+
+// TestWithRemoteOperationEnvUnsetsCredentialsWithNoAmbientPair verifies stored
+// credentials do not linger in the process environment when there was nothing
+// ambient to restore.
+func TestWithRemoteOperationEnvUnsetsCredentialsWithNoAmbientPair(t *testing.T) {
+	unsetEnvForTest(t, "DOLT_REMOTE_USER")
+	unsetEnvForTest(t, "DOLT_REMOTE_PASSWORD")
+
+	creds := &remoteCredentials{username: "peer-user", password: "peer-pass"}
+	err := withRemoteOperationEnv(creds, false, func() error {
+		if got := os.Getenv("DOLT_REMOTE_USER"); got != "peer-user" {
+			t.Fatalf("DOLT_REMOTE_USER during operation = %q, want peer-user", got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withRemoteOperationEnv returned error: %v", err)
+	}
+
+	if _, ok := os.LookupEnv("DOLT_REMOTE_USER"); ok {
+		t.Fatal("DOLT_REMOTE_USER should be unset after operation")
+	}
+	if _, ok := os.LookupEnv("DOLT_REMOTE_PASSWORD"); ok {
+		t.Fatal("DOLT_REMOTE_PASSWORD should be unset after operation")
+	}
+}
+
+// TestWithRemoteOperationEnvRestoresAmbientEnvWithBothCleanups exercises the
+// two-cleanup path, the shape store.go uses for push and pull against an S3
+// remote: credentials plus the checksum override are registered together, so
+// both restores run from the same defer. All three ambient values must come
+// back after the operation.
+func TestWithRemoteOperationEnvRestoresAmbientEnvWithBothCleanups(t *testing.T) {
+	t.Setenv("DOLT_REMOTE_USER", "ambient-user")
+	t.Setenv("DOLT_REMOTE_PASSWORD", "ambient-pass")
+	t.Setenv(awsResponseChecksumValidationEnv, "when_supported")
+
+	creds := &remoteCredentials{username: "peer-user", password: "peer-pass"}
+	err := withRemoteOperationEnv(creds, true, func() error {
+		if got := os.Getenv("DOLT_REMOTE_USER"); got != "peer-user" {
+			t.Fatalf("DOLT_REMOTE_USER during operation = %q, want peer-user", got)
+		}
+		if got := os.Getenv("DOLT_REMOTE_PASSWORD"); got != "peer-pass" {
+			t.Fatalf("DOLT_REMOTE_PASSWORD during operation = %q, want peer-pass", got)
+		}
+		if got := os.Getenv(awsResponseChecksumValidationEnv); got != "when_required" {
+			t.Fatalf("%s during operation = %q, want when_required", awsResponseChecksumValidationEnv, got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withRemoteOperationEnv returned error: %v", err)
+	}
+
+	if got := os.Getenv("DOLT_REMOTE_USER"); got != "ambient-user" {
+		t.Fatalf("DOLT_REMOTE_USER after operation = %q, want restored ambient-user", got)
+	}
+	if got := os.Getenv("DOLT_REMOTE_PASSWORD"); got != "ambient-pass" {
+		t.Fatalf("DOLT_REMOTE_PASSWORD after operation = %q, want restored ambient-pass", got)
+	}
+	if got := os.Getenv(awsResponseChecksumValidationEnv); got != "when_supported" {
+		t.Fatalf("%s after operation = %q, want restored when_supported", awsResponseChecksumValidationEnv, got)
 	}
 }
 
@@ -971,5 +1097,95 @@ func TestEnvPrefixesForRemoteURL(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// An uninitialized credential key is not a key mismatch, and the distinction
+// is reachable from the peer readers: initCredentialKey returns nil without
+// setting a key when beadsDir is empty, so ensureCredentialKey succeeds and
+// decryptPassword still finds no key. Wrapping at the callers labelled that
+// error a mismatch and told the operator to re-add the peer, which does
+// nothing when the key was never created; the fix there is init or file
+// permissions. The wrap therefore lives at the decrypt funnel instead.
+func TestFederationPeerUninitializedKeyIsNotAMismatch(t *testing.T) {
+	// beadsDir empty and credentialKey nil: ensureCredentialKey is a no-op
+	// that reports success, which is the edge the caller-side wrap mislabeled.
+	newStore := func(t *testing.T) (*DoltStore, sqlmock.Sqlmock) {
+		t.Helper()
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock: %v", err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		return &DoltStore{db: db}, mock
+	}
+
+	peerRows := func() *sqlmock.Rows {
+		now := time.Now()
+		return sqlmock.NewRows([]string{
+			"name", "remote_url", "username", "password_encrypted",
+			"sovereignty", "last_sync", "created_at", "updated_at",
+		}).AddRow("team", "https://peer.example/peerdb", "peeruser",
+			[]byte("stored ciphertext"), "T2", nil, now, now)
+	}
+
+	assertNotMismatch := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("read succeeded, want a decrypt failure")
+		}
+		if errors.Is(err, storage.ErrCredentialKeyMismatch) {
+			t.Errorf("error = %v, want NOT errors.Is storage.ErrCredentialKeyMismatch", err)
+		}
+		if !strings.Contains(err.Error(), "credential encryption key not initialized") {
+			t.Errorf("error = %v, want it to name the uninitialized key", err)
+		}
+		if strings.Contains(err.Error(), "re-run 'bd federation add-peer") {
+			t.Errorf("error = %v, must not prescribe re-adding the peer for an uninitialized key", err)
+		}
+	}
+
+	t.Run("GetFederationPeer", func(t *testing.T) {
+		store, mock := newStore(t)
+		mock.ExpectQuery(regexp.QuoteMeta("FROM federation_peers WHERE name = ?")).
+			WithArgs("team").
+			WillReturnRows(peerRows())
+
+		_, err := store.GetFederationPeer(t.Context(), "team")
+		assertNotMismatch(t, err)
+	})
+
+	t.Run("ListFederationPeers", func(t *testing.T) {
+		store, mock := newStore(t)
+		mock.ExpectQuery(regexp.QuoteMeta("FROM federation_peers ORDER BY name")).
+			WillReturnRows(peerRows())
+
+		_, err := store.ListFederationPeers(t.Context())
+		assertNotMismatch(t, err)
+	})
+}
+
+// The key-rotation reader passes an old key to decryptWithKey on purpose, so
+// that helper must stay unwrapped: a rotation miss is not a mismatch.
+func TestDecryptWithKeyStaysUnwrappedForRotation(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	other := make([]byte, 32)
+	for i := range other {
+		other[i] = byte(255 - i)
+	}
+	encrypted, err := encryptWithKey("secret", key)
+	if err != nil {
+		t.Fatalf("encryptWithKey() error = %v", err)
+	}
+
+	_, err = decryptWithKey(encrypted, other)
+	if err == nil {
+		t.Fatal("decryptWithKey with the wrong key succeeded, want an error")
+	}
+	if errors.Is(err, storage.ErrCredentialKeyMismatch) {
+		t.Errorf("error = %v, want the bare cipher error; classification belongs to decryptPassword", err)
 	}
 }
