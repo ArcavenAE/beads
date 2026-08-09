@@ -48,6 +48,11 @@ func interceptProxiedOpens(t *testing.T) *[]capturedProxiedOpen {
 		return nil, errProxiedPolicySentinel
 	}
 	t.Cleanup(func() { openProxiedServerUOWProviderFn = orig })
+	// Root dispatch in a proxied workspace sets the proxiedServerMode global
+	// (and saveAndRestoreGlobals does not cover it); a leaked true diverts
+	// every later test's PersistentPostRunE away from the maintenance block.
+	origProxied := proxiedServerMode
+	t.Cleanup(func() { proxiedServerMode = origProxied })
 	return &captured
 }
 
