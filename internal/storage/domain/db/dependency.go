@@ -95,7 +95,7 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 			return err
 		}
 	}
-	if !opts.CycleValidated && isSchedulingDependency(dep.Type) {
+	if !opts.CycleValidated && types.IsSchedulingEdge(dep.Type) {
 		cycle, err := r.HasCycle(ctx, dep.IssueID, dep.DependsOnID)
 		if err != nil {
 			return fmt.Errorf("db: DependencySQLRepository.Insert: cycle check: %w", err)
@@ -404,10 +404,6 @@ func (r *dependencySQLRepositoryImpl) HasCycle(ctx context.Context, issueID, dep
 		return false, fmt.Errorf("db: DependencySQLRepository.HasCycle: %w", err)
 	}
 	return cycle, nil
-}
-
-func isSchedulingDependency(t types.DependencyType) bool {
-	return t == types.DepBlocks || t == types.DepConditionalBlocks || t == types.DepParentChild
 }
 
 func (r *dependencySQLRepositoryImpl) ListByIssueIDs(ctx context.Context, issueIDs []string, opts domain.DepListOpts) (domain.DepBulkResult, error) {
@@ -909,6 +905,15 @@ func (r *dependencySQLRepositoryImpl) DetectCycleReport(ctx context.Context) (pu
 // user reads, which the direct route never does for the same refusal.
 func (r *dependencySQLRepositoryImpl) WalkDependencyTree(ctx context.Context, req publicops.WalkTreeRequest) (publicops.TreeResult, error) {
 	return issueops.WalkDependencyTreeInTx(ctx, r.runner, req)
+}
+
+// CountEdges runs the SHARED edge-count body, unwrapped for
+// WalkDependencyTree's reason: the body publishes issueops.ErrValidation as the
+// role's own vocabulary, and a `fmt.Errorf("db: ...: %w")` would keep it
+// matchable while putting this repository's name into a message the direct
+// route never decorates.
+func (r *dependencySQLRepositoryImpl) CountEdges(ctx context.Context, req publicops.EdgeCountRequest) (publicops.EdgeCountResult, error) {
+	return issueops.ExecuteEdgeCount(ctx, r.runner, req)
 }
 
 func (r *dependencySQLRepositoryImpl) GetTree(ctx context.Context, rootID string, opts domain.DepTreeOpts) ([]*types.TreeNode, error) {
