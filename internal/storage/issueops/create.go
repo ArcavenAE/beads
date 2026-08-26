@@ -128,12 +128,6 @@ func CreateIssueInTxWithResult(ctx context.Context, tx DBTX, bc *BatchContext, i
 		return result, nil
 	}
 
-	if skip, err := CheckOrphan(ctx, tx, issue, issueTable, bc.Opts.OrphanHandling); err != nil {
-		return result, err
-	} else if skip {
-		return result, nil
-	}
-
 	isNew, staleRejected, err := InsertIssueIfNew(ctx, tx, issueTable, issue, bc.Opts)
 	if err != nil {
 		return result, err
@@ -195,9 +189,8 @@ func CreateIssueInTxWithResult(ctx context.Context, tx DBTX, bc *BatchContext, i
 	}
 	// Journal the create once, after labels and comments are in the row's
 	// transaction, so the snapshot is the complete bead. The early returns above
-	// (collision skip, orphan skip, stale reject) wrote nothing and journal
-	// nothing.
-	if err := RecordEventInTx(ctx, tx, EventCreate, issue.ID); err != nil {
+	// (collision skip, stale reject) wrote nothing and journal nothing.
+	if err := RecordEventInTx(ctx, tx, EventCreate, issue.ID, actor); err != nil {
 		return result, err
 	}
 	// Creation-time comments (import/interchange carries them inline) are
@@ -269,24 +262,37 @@ func CreateIssuesInTx(ctx context.Context, tx DBTX, issues []*types.Issue, actor
 // CreateIssuesInTxWithResult creates issues and reports tables whose writes are
 // only knowable after SQL reconciliation, such as child counter advances.
 func CreateIssuesInTxWithResult(ctx context.Context, tx DBTX, issues []*types.Issue, actor string, opts storage.BatchCreateOptions) (CreateIssuesResult, error) {
+	bc, err := NewBatchContext(ctx, tx, opts)
+	if err != nil {
+		return CreateIssuesResult{}, err
+	}
+	return CreateIssuesInTxWithContext(ctx, tx, bc, issues, actor)
+}
+
+// CreateIssuesInTxWithContext is CreateIssuesInTxWithResult with a
+// caller-supplied BatchContext. Callers that split config reads from row
+// writes across SQL sessions (doltTransaction's wisp tier) build the context
+// on the session that sees in-transaction config writes and pass it here.
+// The caller's bc is not modified, so one context can serve several calls.
+func CreateIssuesInTxWithContext(ctx context.Context, tx DBTX, bc *BatchContext, issues []*types.Issue, actor string) (CreateIssuesResult, error) {
+	opts := bc.Opts
 	filteredIssues, err := filterCreateIssuesMixedBucketDependencies(issues, opts)
 	if err != nil {
 		return CreateIssuesResult{}, err
 	}
 	issues = filteredIssues
 
-	bc, err := NewBatchContext(ctx, tx, opts)
-	if err != nil {
-		return CreateIssuesResult{}, err
-	}
 	// This function already runs a slice-wide ReconcileChildCounters below,
 	// covering every accepted issue; skip the redundant per-issue reconcile.
-	bc.SkipChildCounterReconcile = true
+	// Set the flag on a shallow copy so the caller's context keeps its own
+	// reconcile behavior.
+	batch := *bc
+	batch.SkipChildCounterReconcile = true
 
 	result := CreateIssuesResult{}
 	accepted := issues[:0:0]
 	for _, issue := range issues {
-		issueResult, err := CreateIssueInTxWithResult(ctx, tx, bc, issue, actor)
+		issueResult, err := CreateIssueInTxWithResult(ctx, tx, &batch, issue, actor)
 		if err != nil {
 			return CreateIssuesResult{}, err
 		}
@@ -599,37 +605,6 @@ func AllWisps(issues []*types.Issue) bool {
 		}
 	}
 	return true
-}
-
-// CheckOrphan handles orphan detection for hierarchical IDs.
-// Returns (skip=true, nil) if the issue should be skipped.
-//
-//nolint:gosec // G201: table is a hardcoded constant
-func CheckOrphan(ctx context.Context, tx DBTX, issue *types.Issue, issueTable string, handling storage.OrphanHandling) (skip bool, err error) {
-	if issue.ID == "" {
-		return false, nil
-	}
-	parentID, _, ok := ParseHierarchicalID(issue.ID)
-	if !ok {
-		return false, nil
-	}
-
-	var parentCount int
-	if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE id = ?`, issueTable), parentID).Scan(&parentCount); err != nil {
-		return false, fmt.Errorf("failed to check parent existence: %w", err)
-	}
-	if parentCount > 0 {
-		return false, nil
-	}
-
-	switch handling {
-	case storage.OrphanStrict:
-		return false, fmt.Errorf("parent issue %s does not exist (strict mode)", parentID)
-	case storage.OrphanSkip:
-		return true, nil
-	default: // OrphanAllow, OrphanResurrect
-		return false, nil
-	}
 }
 
 // checkCrossTableIDCollision rejects a create whose ID already lives in the
@@ -995,7 +970,7 @@ func PersistDependenciesWithOptionsResult(ctx context.Context, tx DBTX, issues [
 				}
 				// Creation-time edges are independently replayable operations; do
 				// not rely on the issue create payload's inline dependencies.
-				if err := RecordDepEventInTx(ctx, tx, EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID, metadata); err != nil {
+				if err := RecordDepEventInTx(ctx, tx, EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID, metadata, actor); err != nil {
 					return result, err
 				}
 			}

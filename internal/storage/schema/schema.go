@@ -237,6 +237,21 @@ type migrationSource struct {
 	// TestSentinelTablesAreCreatedByTheSeries enforces the creating side only;
 	// the dropping side is this comment.
 	sentinelTables []string
+	// sentinelColumns are clone-local columns whose absence contradicts an
+	// otherwise at-latest cursor just as strongly as an absent sentinel table.
+	//
+	// INVARIANT: no future migration in this series may DROP or RENAME a
+	// sentinel column (or the table carrying it). Older binaries in the field
+	// check their own sentinel list against the live schema, so removing one
+	// would make every healthy newer database read as "contradicted" to them
+	// and re-run their whole series. TestSentinelColumnsAreCreatedByTheSeries
+	// enforces the creating side only; the dropping side is this comment.
+	sentinelColumns []schemaSentinelColumn
+}
+
+type schemaSentinelColumn struct {
+	table  string
+	column string
 }
 
 var (
@@ -254,6 +269,9 @@ var (
 		// missing; wisps is checked too so a partially materialized database
 		// is caught by whichever is absent.
 		sentinelTables: []string{"wisps", "wisp_dependencies"},
+		// A historical ignored-v16 ordinal collision can leave the local
+		// leases table present but without the column frozen 0016 adds.
+		sentinelColumns: []schemaSentinelColumn{{table: "leases", column: "granted_node"}},
 	}
 )
 
@@ -1112,6 +1130,23 @@ func (m migrationSource) atLatest(ctx context.Context, db DBConn) bool {
 }
 
 func (m migrationSource) currentVersion(ctx context.Context, db DBConn) (int, error) {
+	// Probe existence with a query that always SUCCEEDS before ever issuing one
+	// that can fail. A Dolt session that issues a failing statement stays
+	// pinned to its pre-statement catalog snapshot, so a bare SELECT against a
+	// not-yet-created cursor table poisons the pooled connection: tables
+	// created afterwards on other connections stay invisible to this one for
+	// the rest of its life in the pool (be-bv7x).
+	var cursorExists int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?",
+		m.cursorTable,
+	).Scan(&cursorExists); err != nil {
+		return 0, fmt.Errorf("probing %s existence: %w", m.cursorTable, err)
+	}
+	if cursorExists == 0 {
+		return 0, nil
+	}
+
 	var current int
 	err := db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM "+m.cursorTable).Scan(&current)
 	if err != nil && err != sql.ErrNoRows {
@@ -1163,6 +1198,15 @@ func (m migrationSource) cursorContradictedBySchema(ctx context.Context, db DBCo
 			return true, nil
 		}
 	}
+	for _, column := range m.sentinelColumns {
+		present, err := sentinelColumnExists(ctx, db, column.table, column.column)
+		if err != nil {
+			return false, fmt.Errorf("checking %s sentinel column %s.%s: %w", m.cursorTable, column.table, column.column, err)
+		}
+		if !present {
+			return true, nil
+		}
+	}
 	return false, nil
 }
 
@@ -1179,6 +1223,8 @@ var sentinelTableExists = func(ctx context.Context, db DBConn, table string) (bo
 	}
 	return n > 0, nil
 }
+
+var sentinelColumnExists = schemaColumnExists
 
 func (m migrationSource) pendingVersions(ctx context.Context, db DBConn) ([]int, error) {
 	current, err := m.currentVersion(ctx, db)
@@ -1288,24 +1334,133 @@ var procedureCallRe = regexp.MustCompile(`(?i)(?:^|;|\n)\s*CALL\s`)
 // dolt_nonlocal_tables rows, 0041 DELETEs then commits them) are made
 // replay-safe by pre-migration repairs keyed to their version, not by editing
 // their shipped SQL — see preMigrationRepair and migration_repairs.go.
+// Most Dolt procedures are called for their side effects alone, and DrainCall
+// discards what they return. That is a statement about these CALL SITES, not
+// about stored procedures in general: DOLT_PULL and DOLT_MERGE report what they
+// did — whether anything merged, and whether it conflicted — only in the row
+// they return. A caller that needs that report uses CallReturningRow, which
+// drains identically.
 func DrainCall(ctx context.Context, db DBConn, query string, args ...any) error {
 	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = rows.Close() }()
+	return drainResultSets(rows, nil)
+}
+
+// CallRow is the first row of a CALL's first result set, keyed by column name.
+// Dolt's procedure rows mix integers with a nullable message, and their column
+// ORDER is a documented-but-unversioned detail (dolt_pull.go pins the
+// fast_forward index in a const with a comment warning it must be updated if
+// the schema changes), so values are read by name and scanned as NullString.
+type CallRow map[string]sql.NullString
+
+// Str returns the named column's text. ok is false when the column is absent
+// from the row or is SQL NULL — DOLT_PULL returns a NULL message whenever its
+// internal message is empty, which is a distinct outcome from any message it
+// might actually spell out.
+func (r CallRow) Str(name string) (value string, ok bool) {
+	v, present := r[name]
+	if !present || !v.Valid {
+		return "", false
+	}
+	return v.String, true
+}
+
+// Int returns the named column parsed as an integer. ok is false when the
+// column is absent, NULL, or not a number.
+func (r CallRow) Int(name string) (value int, ok bool) {
+	s, present := r.Str(name)
+	if !present {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// CallReturningRow runs a CALL exactly as DrainCall does — consuming every row
+// of every result set, so the pinned connection is left clean for the next
+// command — and additionally returns the FIRST row of the FIRST result set.
+//
+// The drain is the load-bearing part and is shared with DrainCall verbatim; see
+// DrainCall's comment for the go-sql-driver error-path asymmetry that makes it
+// necessary. Scanning a row does not shorten the drain: the loop keeps running
+// to the end of every result set whether or not the scan succeeded. Reaching
+// for QueryRowContext instead would drain only the first result set and
+// reintroduce the busy-buffer bug on the pinned *sql.Tx that the pull path uses.
+//
+// A CALL that returns no rows at all yields a nil CallRow and a nil error;
+// reading a column from a nil CallRow reports absent rather than panicking.
+func CallReturningRow(ctx context.Context, db DBConn, query string, args ...any) (CallRow, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var first CallRow
+	if err := drainResultSets(rows, &first); err != nil {
+		return nil, err
+	}
+	return first, nil
+}
+
+// drainResultSets consumes every row of every result set the statement
+// produced. When capture is non-nil the first row of the first result set is
+// also scanned into it; every other row is read and discarded, which is what
+// frees the connection buffer for the next command.
+//
+// A scan failure is recorded and the drain continues, so a row this package
+// cannot decode still leaves a usable connection behind. The drain's own error
+// wins over the scan's: a broken result set explains a failed scan, not the
+// other way round.
+func drainResultSets(rows *sql.Rows, capture *CallRow) error {
+	var scanErr error
+	firstSet := true
 	for {
-		// Consume every row of the current result set. The values are
-		// irrelevant — a CALL's effect comes from its side effects, not from
-		// anything it returns — but reading them is what frees the connection
-		// buffer for the next command.
-		for rows.Next() { //nolint:revive // intentional drain, no body needed
+		for rows.Next() {
+			if capture != nil && firstSet && *capture == nil && scanErr == nil {
+				row, err := scanRowByColumn(rows)
+				if err != nil {
+					scanErr = err
+					continue
+				}
+				*capture = row
+			}
 		}
+		firstSet = false
 		if !rows.NextResultSet() {
 			break
 		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return scanErr
+}
+
+// scanRowByColumn reads the row the cursor is on into a column-name-keyed map.
+func scanRowByColumn(rows *sql.Rows) (CallRow, error) {
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	values := make([]sql.NullString, len(cols))
+	targets := make([]any, len(cols))
+	for i := range values {
+		targets[i] = &values[i]
+	}
+	if err := rows.Scan(targets...); err != nil {
+		return nil, err
+	}
+	row := make(CallRow, len(cols))
+	for i, name := range cols {
+		row[name] = values[i]
+	}
+	return row, nil
 }
 
 // execMigrationBody applies one migration file's SQL on the pinned migration

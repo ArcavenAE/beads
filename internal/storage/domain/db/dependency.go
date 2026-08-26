@@ -95,7 +95,7 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 			return err
 		}
 	}
-	if !opts.CycleValidated && isSchedulingDependency(dep.Type) {
+	if !opts.CycleValidated && types.IsSchedulingEdge(dep.Type) {
 		cycle, err := r.HasCycle(ctx, dep.IssueID, dep.DependsOnID)
 		if err != nil {
 			return fmt.Errorf("db: DependencySQLRepository.Insert: cycle check: %w", err)
@@ -124,7 +124,7 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 			}
 			// A same-type add refreshes edge metadata. It is an observable graph
 			// mutation, so emit the complete replacement edge for replay.
-			return issueops.RecordDepEventInTx(ctx, r.runner, issueops.EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID, metadata)
+			return issueops.RecordDepEventInTx(ctx, r.runner, issueops.EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID, metadata, actor)
 		}
 		return &domain.DependencyTypeConflictError{
 			IssueID:       dep.IssueID,
@@ -216,7 +216,7 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 			return fmt.Errorf("db: DependencySQLRepository.Insert: recompute is_blocked: %w", err)
 		}
 		// Snapshot only after all derived blocked-state maintenance has completed.
-		return issueops.RecordDepEventInTx(ctx, r.runner, issueops.EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID, metadata)
+		return issueops.RecordDepEventInTx(ctx, r.runner, issueops.EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID, metadata, actor)
 	}
 	if err := issueops.MarkIsBlockedInTx(ctx, r.runner, affectedIssues, affectedWisps); err != nil {
 		return fmt.Errorf("db: DependencySQLRepository.Insert: mark is_blocked (affected): %w", err)
@@ -224,7 +224,7 @@ func (r *dependencySQLRepositoryImpl) Insert(ctx context.Context, dep *types.Dep
 	// Snapshot only after all derived blocked-state maintenance has completed.
 	// Never gated on opts.EmitEvent: a structurally-wired edge is as real to a
 	// replaying consumer as one added by an explicit dep verb.
-	return issueops.RecordDepEventInTx(ctx, r.runner, issueops.EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID, metadata)
+	return issueops.RecordDepEventInTx(ctx, r.runner, issueops.EventDepAdd, dep.IssueID, string(dep.Type), dep.DependsOnID, metadata, actor)
 }
 
 // classifyMissingEndpoint names the endpoint behind a foreign-key refusal,
@@ -387,7 +387,7 @@ func (r *dependencySQLRepositoryImpl) Delete(ctx context.Context, issueID, depen
 	// Snapshot only after all derived blocked-state maintenance has completed.
 	// Never gated on opts.EmitEvent — a structural removal is as real to a
 	// replaying consumer as one from an explicit dep verb.
-	if err := issueops.RecordDepEventInTx(ctx, r.runner, issueops.EventDepRemove, issueID, depType, dependsOnID, depMetadata); err != nil {
+	if err := issueops.RecordDepEventInTx(ctx, r.runner, issueops.EventDepRemove, issueID, depType, dependsOnID, depMetadata, actor); err != nil {
 		return domain.DepDeleteResult{}, err
 	}
 
@@ -404,10 +404,6 @@ func (r *dependencySQLRepositoryImpl) HasCycle(ctx context.Context, issueID, dep
 		return false, fmt.Errorf("db: DependencySQLRepository.HasCycle: %w", err)
 	}
 	return cycle, nil
-}
-
-func isSchedulingDependency(t types.DependencyType) bool {
-	return t == types.DepBlocks || t == types.DepConditionalBlocks || t == types.DepParentChild
 }
 
 func (r *dependencySQLRepositoryImpl) ListByIssueIDs(ctx context.Context, issueIDs []string, opts domain.DepListOpts) (domain.DepBulkResult, error) {
@@ -909,6 +905,15 @@ func (r *dependencySQLRepositoryImpl) DetectCycleReport(ctx context.Context) (pu
 // user reads, which the direct route never does for the same refusal.
 func (r *dependencySQLRepositoryImpl) WalkDependencyTree(ctx context.Context, req publicops.WalkTreeRequest) (publicops.TreeResult, error) {
 	return issueops.WalkDependencyTreeInTx(ctx, r.runner, req)
+}
+
+// CountEdges runs the SHARED edge-count body, unwrapped for
+// WalkDependencyTree's reason: the body publishes issueops.ErrValidation as the
+// role's own vocabulary, and a `fmt.Errorf("db: ...: %w")` would keep it
+// matchable while putting this repository's name into a message the direct
+// route never decorates.
+func (r *dependencySQLRepositoryImpl) CountEdges(ctx context.Context, req publicops.EdgeCountRequest) (publicops.EdgeCountResult, error) {
+	return issueops.ExecuteEdgeCount(ctx, r.runner, req)
 }
 
 func (r *dependencySQLRepositoryImpl) GetTree(ctx context.Context, rootID string, opts domain.DepTreeOpts) ([]*types.TreeNode, error) {
