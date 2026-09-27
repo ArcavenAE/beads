@@ -106,7 +106,7 @@ Any key whose name contains `api_key`, `api-key`, `secret`, `token`, or `passwor
 | `agent.profile` | — | `BD_AGENT_PROFILE` | `conservative` | Policy profile `bd prime` uses for git/commit authority: `conservative`, `minimal`, `team-maintainer`; invalid values fall back to `conservative` |
 | `prime.max-memories` | `--max-memories` | `BD_PRIME_MAX_MEMORIES` | `0` | Max persistent memories injected by `bd prime` (0 = unlimited) |
 | `prime.max-memory-chars` | `--max-memory-chars` | `BD_PRIME_MAX_MEMORY_CHARS` | `0` | Max total bytes of memory entries injected by `bd prime`, at whole-memory boundaries (0 = unlimited) |
-| `dolt.auto-commit` | `--dolt-auto-commit` | `BD_DOLT_AUTO_COMMIT` | `on` | Create a Dolt history commit after each successful write (see [below](#auto-commit-sql-commits-vs-dolt-commits)) |
+| `dolt.auto-commit` | `--dolt-auto-commit` | `BD_DOLT_AUTO_COMMIT` | `on` | `off\|on\|batch`: `on` creates a Dolt history commit after each successful write; `batch`/`off` defer it to `bd dolt commit` (see [below](#auto-commit-sql-commits-vs-dolt-commits)) |
 | `dolt.auto-push` | — | `BD_DOLT_AUTO_PUSH` | `false` | Auto-push to Dolt remote after writes (opt-in; see [below](#auto-push)) |
 | `dolt.auto-push-interval` | — | `BD_DOLT_AUTO_PUSH_INTERVAL` | `5m` | Minimum time between auto-pushes |
 | `dolt.auto-push-timeout` | — | `BD_DOLT_AUTO_PUSH_TIMEOUT` | `30s` | Timeout for a single auto-push attempt |
@@ -196,6 +196,26 @@ dolt:
   auto-commit: off
 ```
 
+`batch` and `off` defer the Dolt history commit instead of skipping the write: the change is
+still durable in the working set, and `bd dolt commit` records the accumulated batch as a single
+Dolt commit. This applies on every storage mode — embedded, direct SQL-server, and
+proxied-server. In proxied-server mode the deferral covers the writes the CLI makes on that
+route, including workspace config and version metadata, and `bd dolt commit` is the only flush
+point there: the SIGTERM/SIGHUP flush of a live batch-mode process needs an open store, which
+proxied mode never has (it does run in embedded and direct SQL-server modes).
+
+Two kinds of write stay outside the deferral, in every mode:
+
+- **Explicit commit points** — `bd batch` (whose commit message defaults to a synthesized one
+  when `-m` is absent, so every batch commits), `bd mol bond`, `bd mol pour`, `bd mol squash`,
+  `bd mol wisp create`, and the wisp half of `bd mol burn` — commit what they wrote, with the
+  message they were given: the commit is that command's contract rather than auto-commit
+  policy. Burning a *persistent* molecule is an ordinary delete, so it honors the policy and
+  defers with everything else.
+- **Writes made by a `bd serve` process**, whose HTTP API requests carry their own context
+  instead of the CLI's, so a daemon keeps committing per write even while the CLI on the same
+  database defers.
+
 ### Auto-backup
 
 Periodic Dolt-native backup to `.beads/backup/` provides a recovery path independent of the live database. Local Dolt commits (via `dolt.auto-commit`) remain the primary safety net; backup is a secondary layer. Unlike `bd export` or `.beads/issues.jsonl`, this is a full database backup: it preserves tables, branches, commit history, and working-set data.
@@ -281,6 +301,7 @@ These are written to the Dolt database by `bd config set` and have no env var ov
 | `issue_id_mode` | `hash` (default) \| `counter` (see [below](#sequential-counter-ids)) |
 | `min_hash_length`, `max_hash_length` | Adaptive ID bounds (defaults `3` and `8`) |
 | `max_collision_prob` | Hash ID collision tolerance (default `0.25`) |
+| `claim.pools` | Comma-separated pool aliases: placeholder assignees that any actor can take with `bd update <id> --claim` (see [below](#claim-pools)). Unset by default, which turns pool claiming off |
 | `doctor.suppress.*` | Suppress specific `bd doctor` warnings by check slug (warnings only; errors always show) |
 
 Issue prefix (`issue_prefix`) is **not** settable via `bd config set` — use `bd init --prefix`, `bd bootstrap`, or `bd rename-prefix`.
@@ -353,6 +374,23 @@ bd config set max_collision_prob "0.01"   # Stricter collision tolerance (defaul
 bd config set min_hash_length "5"         # Force minimum 5-char IDs (default 3)
 bd config set max_hash_length "8"         # Upper bound (default 8)
 ```
+
+### Claim Pools
+
+A dispatcher can pre-assign issues to a pool alias, a placeholder assignee such as `fable-crew`, and let any actor take them with `bd update <id> --claim`. List the aliases in `claim.pools`:
+
+```bash
+bd config set claim.pools "fable-crew,night-crew"
+```
+
+Claiming reads this key from the database only. A `claim.pools` value in `config.yaml` or in an environment variable has no effect, even though `bd config show` lists a `config.yaml` value with the source `(config.yaml)`. A value that claiming uses shows the source `(database)`.
+
+- **Exact match.** The value is split on commas and each entry is trimmed of surrounding whitespace. An issue counts as pool-assigned only when its assignee equals one of the entries exactly, including case: `Crew-A` is not the pool `crew-a`.
+- **Claiming.** Taking a pool-assigned issue works like taking an unassigned one: the claimer becomes the assignee, the status moves to `in_progress`, and the claim gets the normal lease.
+- **Anti-steal.** Issues assigned to a real actor, or to an alias that is not listed, keep their protection: `--claim` refuses them.
+- **Reassigning.** `bd assign` and `bd update <id> --assignee` can move an `in_progress` issue that a pool alias holds without `--force`.
+- **`bd ready --claim`** takes only unassigned issues, so it skips pool-assigned ones even though `bd ready` lists them. Claim those by ID.
+- **Lease expiry.** If the claimer's lease expires, `bd reclaim` sets the issue back to `open` with no assignee. It does not return the issue to the pool alias, so a dispatcher that wants it back in the pool has to reassign it.
 
 ## Sync and Federation
 
