@@ -375,11 +375,7 @@ func TestNewExternalDoltServerUOWProvider_ExistingDatabaseOpensWithoutCreatePriv
 
 	storeRootDir := t.TempDir()
 	shutdownOnInterrupt(t, storeRootDir)
-	t.Cleanup(func() {
-		if err := proxy.Shutdown(storeRootDir); err != nil {
-			t.Logf("proxy.Shutdown(%s): %v", storeRootDir, err)
-		}
-	})
+	verifiedShutdownCleanup(t, storeRootDir)
 	logPath := filepath.Join(t.TempDir(), "server.log")
 	external := configfile.ExternalDoltConfig{Host: "127.0.0.1", Port: portInt}
 
@@ -465,11 +461,7 @@ func TestNewExternalDoltServerUOWProvider_MissingDatabaseWithCreateDisabled(t *t
 
 	storeRootDir := t.TempDir()
 	shutdownOnInterrupt(t, storeRootDir)
-	t.Cleanup(func() {
-		if err := proxy.Shutdown(storeRootDir); err != nil {
-			t.Logf("proxy.Shutdown(%s): %v", storeRootDir, err)
-		}
-	})
+	verifiedShutdownCleanup(t, storeRootDir)
 	logPath := filepath.Join(t.TempDir(), "server.log")
 	external := configfile.ExternalDoltConfig{Host: "127.0.0.1", Port: portInt}
 
