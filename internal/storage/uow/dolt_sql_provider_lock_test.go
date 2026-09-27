@@ -106,8 +106,8 @@ func TestInitSchemaAcquiresMigrationLockBeforeBootstrapDDL(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
 		WithArgs(lockName, 5).
 		WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(1))
-	mock.ExpectQuery(regexp.QuoteMeta("SHOW DATABASES")).
-		WillReturnRows(sqlmock.NewRows([]string{"Database"}))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = ?")).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	mock.ExpectExec(regexp.QuoteMeta("CREATE DATABASE `beads`")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(regexp.QuoteMeta("USE `beads`")).
@@ -189,8 +189,8 @@ func TestInitSchemaConvergenceProbeRunsWithNoSessionDatabase(t *testing.T) {
 	// already there is opened without a CREATE attempt at all. The outcome the
 	// bare CREATE used to establish is unchanged: this init did not create the
 	// database, so it captures no fresh-bootstrap heal authority.
-	mock.ExpectQuery(regexp.QuoteMeta("SHOW DATABASES")).
-		WillReturnRows(sqlmock.NewRows([]string{"Database"}).AddRow("beads"))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = ?")).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 	mock.ExpectExec(regexp.QuoteMeta("USE `beads`")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	// The shared-store migration gate, between preparation and MigrateUp. This

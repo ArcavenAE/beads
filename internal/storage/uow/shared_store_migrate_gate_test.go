@@ -47,8 +47,8 @@ func expectBehindDatabaseThroughPreparation(mock sqlmock.Sqlmock, database strin
 	// opened without a CREATE attempt at all. The outcome is unchanged: this
 	// init did not create the database and captures no fresh-bootstrap heal
 	// authority, and the USE is all it contributes.
-	mock.ExpectQuery(regexp.QuoteMeta("SHOW DATABASES")).
-		WillReturnRows(sqlmock.NewRows([]string{"Database"}).AddRow(database))
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = ?")).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 	mock.ExpectExec(regexp.QuoteMeta("USE `" + database + "`")).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	return lockName
@@ -157,8 +157,8 @@ func TestInitSchemaSharedStoreGate(t *testing.T) {
 			WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(1))
 		// Locked preparation probes before any DDL: the database is absent, so
 		// the create-enabled open proceeds to the bare CREATE.
-		mock.ExpectQuery(regexp.QuoteMeta("SHOW DATABASES")).
-			WillReturnRows(sqlmock.NewRows([]string{"Database"}))
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = ?")).
+			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 		mock.ExpectExec(regexp.QuoteMeta("CREATE DATABASE `beads`")).
 			WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectExec(regexp.QuoteMeta("USE `beads`")).
