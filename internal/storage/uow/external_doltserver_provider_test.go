@@ -495,8 +495,8 @@ func TestNewExternalDoltServerUOWProvider_MissingDatabaseWithCreateDisabled(t *t
 	}
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `database "beads_absent" not found on Dolt server`)
-	assert.Contains(t, err.Error(), "run 'bd init' to create a new database")
-	assert.Contains(t, err.Error(), "or 'bd bootstrap' to restore an existing project")
+	assert.Contains(t, err.Error(), "run 'bd init' to create it")
+	assert.NotContains(t, err.Error(), "bd bootstrap", "bd bootstrap does not restore into a proxied server")
 
 	// Nothing may have been created by the failed open.
 	admin, err := sql.Open("mysql", fmt.Sprintf("root:@tcp(127.0.0.1:%d)/?parseTime=true", portInt))

@@ -153,3 +153,20 @@ func TestProxiedCreatePolicy_CleanDatabasesOpensServerWideWithoutCreate(t *testi
 	assert.Empty(t, got.databaseOverride,
 		"maintenance is server-scoped; it never targets an override database")
 }
+
+func TestProxiedCreatePolicy_PrimeMemoryReadOpensWithCreateDisabled(t *testing.T) {
+	captured := interceptProxiedOpens(t)
+
+	_, err := primeProxiedProviderOpen(context.Background(), t.TempDir())
+	require.ErrorIs(t, err, errProxiedPolicySentinel,
+		"prime's memory read must open through the proxied seam")
+
+	require.Len(t, *captured, 1, "prime's memory read performs exactly one proxied open")
+	got := (*captured)[0]
+	assert.False(t, uow.CreateIfMissingForTest(got.opts...),
+		"a session-start hook must never create a missing database")
+	assert.False(t, uow.NoDatabaseBindForTest(got.opts...),
+		"prime reads the configured database")
+	assert.Equal(t, assertWorkspaceIdentity, got.posture,
+		"prime reads this workspace's project")
+}

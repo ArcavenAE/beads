@@ -587,7 +587,7 @@ func (b *bootstrapPreparer) prepare(ctx context.Context, conn *sql.Conn) (*schem
 			// attempted.
 		case !b.provider.createIfMissing:
 			return nil, &bootstrapPreparationError{err: fmt.Errorf(
-				"uow: database %q not found on Dolt server; run 'bd init' to create a new database, or 'bd bootstrap' to restore an existing project",
+				"uow: database %q not found on Dolt server; run 'bd init' to create it",
 				b.database)}
 		default:
 			switch err := ddl.CreateDatabase(ctx, b.database); {
@@ -828,11 +828,10 @@ func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUse
 	// a database that already exists, which is every open but the very
 	// first — costs ONE MySQL session instead of two: initSchema runs on
 	// this pool (USE + the converged-schema reads, or a real migration
-	// when one is pending; the bare CREATE DATABASE inside the locked
-	// preparation is refused with 1007 exactly as it is on a no-database
-	// connection, so `created` stays false and fresh-bootstrap heal can
-	// never be armed by a database this call did not create), and the
-	// same pool is then handed to the provider.
+	// when one is pending; the locked preparation's probe finds the
+	// database and issues no CREATE, so `created` stays false and
+	// fresh-bootstrap heal can never be armed by a database this call did
+	// not create), and the same pool is then handed to the provider.
 	//
 	// Reusing the migrating pool is safe — but NOT because migrations leave
 	// the session alone. They do not: six shipped migrations issue
