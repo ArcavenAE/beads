@@ -424,7 +424,7 @@ func TestNewExternalDoltServerUOWProvider_ExistingDatabaseOpensWithoutCreatePriv
 		false,
 		"",
 	)
-	require.NoError(t, err, "opening an existing database as a least-privilege account must not attempt CREATE DATABASE")
+	require.NoError(t, err, "opening an existing, converged database as a least-privilege account must succeed")
 	require.NotNil(t, provider)
 	t.Cleanup(func() { _ = provider.Close(context.Background()) })
 
