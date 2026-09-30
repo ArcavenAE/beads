@@ -487,7 +487,8 @@ func TestNewExternalDoltServerUOWProvider_MissingDatabaseWithCreateDisabled(t *t
 	}
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `database "beads_absent" not found on Dolt server`)
-	assert.Contains(t, err.Error(), "run 'bd init' to create it")
+	assert.Contains(t, err.Error(), "check dolt_database in .beads/metadata.json")
+	assert.NotContains(t, err.Error(), "bd init", "bd init refuses in an initialized workspace, so it cannot be the remedy")
 	assert.NotContains(t, err.Error(), "bd bootstrap", "bd bootstrap does not restore into a proxied server")
 
 	// Nothing may have been created by the failed open.

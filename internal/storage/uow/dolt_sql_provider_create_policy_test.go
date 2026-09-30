@@ -41,7 +41,7 @@ func TestInitSchemaRefusesMissingDatabaseWithCreateDisabled(t *testing.T) {
 		serverEndpoint: "tcp:127.0.0.1:3306",
 	}
 	err = p.initSchema(context.Background(), "beads")
-	if err == nil || !strings.Contains(err.Error(), `database "beads" not found on Dolt server; run 'bd init' to create it`) {
+	if err == nil || !strings.Contains(err.Error(), `database "beads" not found on Dolt server; check dolt_database in .beads/metadata.json (or BEADS_DOLT_SERVER_DATABASE, --database, --db)`) {
 		t.Fatalf("initSchema() error = %v, want the not-found refusal", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

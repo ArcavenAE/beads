@@ -139,9 +139,9 @@ type providerOptions struct {
 	// WithNoDatabaseBind.
 	noDatabaseBind bool
 	// readOnly opens for a command that only reads (bd list, show, …). It is
-	// deliberately weaker than preview: the open still creates and migrates as
-	// usual, because a read command on a fresh or behind workspace has always
-	// been served by the ordinary open. It changes exactly one thing — when
+	// deliberately weaker than preview: the open migrates as usual (creation
+	// is governed by createIfMissing), because a read command on a behind
+	// workspace has always been served by the ordinary open. It changes exactly one thing — when
 	// the shared-store migration gate refuses, the open warns and attaches to
 	// the database at its current schema instead of failing, so reads keep
 	// working through the upgrade window. That is the same warn-and-continue
@@ -587,7 +587,7 @@ func (b *bootstrapPreparer) prepare(ctx context.Context, conn *sql.Conn) (*schem
 			// attempted.
 		case !b.provider.createIfMissing:
 			return nil, &bootstrapPreparationError{err: fmt.Errorf(
-				"uow: database %q not found on Dolt server; run 'bd init' to create it",
+				"uow: database %q not found on Dolt server; check dolt_database in .beads/metadata.json (or BEADS_DOLT_SERVER_DATABASE, --database, --db)",
 				b.database)}
 		default:
 			switch err := ddl.CreateDatabase(ctx, b.database); {
